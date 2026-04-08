@@ -305,14 +305,11 @@ class Preprocessor:
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
-        """Local view feature (49D): crop center 7×7 from 21×21.
+        """Local view feature (441D): flatten full 21×21 view.
 
-        局部视野特征（49D）：从 21×21 视野中心裁剪 7×7。
+        局部视野特征（441D）：使用完整 21×21 视野并展开。
         """
-        center = self.VIEW_HALF
-        h = self.LOCAL_HALF
-        crop = self._view_map[center - h : center + h + 1, center - h : center + h + 1]
-        return (crop / 2.0).flatten()
+        return (self._view_map / 2.0).flatten()
 
     def _get_global_state_feature(self):
         """Global state feature (12D).

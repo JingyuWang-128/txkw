@@ -16,7 +16,7 @@ class Config:
     # Feature dimensions
     # 特征维度
     FEATURES = [
-        7 * 7,
+        21 * 21,
         12,
         8,
         4,  # charger feats
