@@ -1,0 +1,5 @@
+dev/log/
+dev/.env
+train/*
+123/*
+code/ckpt
