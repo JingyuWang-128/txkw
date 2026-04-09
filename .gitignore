@@ -1,5 +1,3 @@
 dev/log/
 dev/.env
-train/backup_model/
-train/log/
-train/.env
+train/*
