@@ -24,3 +24,7 @@ max_step = 1000
 # Maximum battery. The battery level when fully charged. Range: 100~999.
 # 最大电量。满电状态下的电量。可配置范围100～999。
 battery_max = 200
+
+# Resume training from a zip checkpoint. Set to empty string "" to disable resume.
+# 从 zip 检查点恢复训练。设为空字符串 "" 则不启用。
+resume_zip_path = "F:\\txkw-main00\\txkw-main\\train\\backup_model\\robot_vacuum-ppo-285471-2026_04_11_16_54_50-13.0.1.zip"

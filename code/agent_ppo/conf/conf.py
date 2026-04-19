@@ -22,8 +22,12 @@ class Config:
         4,         # charger feats
         4,         # npc feats
         35,        # traj feats (K=4 => 32 + dx/dz + loop)
-        5,         # memory feats (原3 → 5)
+        5,         # memory feats
         2,         # bfs feats (charger + dirt)
+        4,         # frontier_dists: 4 directions to nearest cleanable cell
+        4,         # frontier_exists: whether cleanable cell exists in 4 directions
+        1,         # bfs_unexplored_dist: BFS distance to nearest cleanable cell
+        8,         # bfs_unexplored_dir: one-hot direction to nearest cleanable cell
     ]
     FEATURE_SPLIT_SHAPE = FEATURES
     FEATURE_LEN = sum(FEATURES)

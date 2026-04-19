@@ -11,7 +11,10 @@ Training workflow for Robot Vacuum.
 """
 
 import os
+import shutil
+import tempfile
 import time
+import zipfile
 
 import numpy as np
 
@@ -33,6 +36,39 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     if usr_conf is None:
         logger.error("usr_conf is None, please check agent_ppo/conf/train_env_conf.toml")
         return
+
+    # Resume from zip checkpoint
+    # 从 zip 检查点恢复训练
+    resume_zip_path = usr_conf.get("resume_zip_path", "")
+    resume_dir = None
+    if resume_zip_path and os.path.isfile(resume_zip_path):
+        logger.info(f"Resume training from zip: {resume_zip_path}")
+        try:
+            resume_dir = tempfile.mkdtemp(prefix="ppo_resume_")
+            with zipfile.ZipFile(resume_zip_path, 'r') as zip_ref:
+                zip_ref.extractall(resume_dir)
+            logger.info(f"Extracted zip to: {resume_dir}")
+            # Load model from extracted directory
+            # 优先加载 latest，其次加载 checkpoint-1
+            latest_path = os.path.join(resume_dir, "model.ckpt-latest.pkl")
+            ckpt_path = os.path.join(resume_dir, "model.ckpt-1.pkl")
+            if os.path.exists(latest_path):
+                agent.load_model(path=resume_dir, id="latest")
+            elif os.path.exists(ckpt_path):
+                agent.load_model(path=resume_dir, id="1")
+            else:
+                # 列出解压后的所有 .pkl 文件
+                pkl_files = [f for f in os.listdir(resume_dir) if f.endswith('.pkl')]
+                logger.warning(f"No model.ckpt-latest.pkl or model.ckpt-1.pkl found. Available: {pkl_files}")
+        except Exception as e:
+            logger.error(f"Failed to resume from zip: {e}")
+            if resume_dir and os.path.exists(resume_dir):
+                shutil.rmtree(resume_dir)
+            resume_dir = None
+    else:
+        if resume_zip_path:
+            logger.warning(f"resume_zip_path set but file not found: {resume_zip_path}")
+        logger.info("Starting training from scratch (no resume zip)")
 
     episode_runner = EpisodeRunner(
         env=env,

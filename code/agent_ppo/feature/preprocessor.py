@@ -214,7 +214,7 @@ class Preprocessor:
         d = np.sqrt(dx * dx + dz * dz)
         return float(np.min(d)) if d.size > 0 else 200.0
 
-    def _bfs_distance(self, start, targets, max_expand=4096):
+    def _bfs_distance(self, start, targets, max_expand=1024):
         """BFS shortest path distance on passable_map (4-neighborhood).
 
         Returns large value if unreachable or targets empty.
@@ -525,15 +525,124 @@ class Preprocessor:
 
     def _bfs_feats(self):
         # BFS distances (path length) normalized
-        max_bfs = 256.0
+        max_bfs = 320.0  # 略大于电池容量 300
         d_ch = float(np.clip(self.bfs_d_charger, 0.0, max_bfs))
         d_di = float(np.clip(self.bfs_d_dirt, 0.0, max_bfs))
         return np.array([d_ch / max_bfs, d_di / max_bfs], dtype=np.float32)
 
-    def feature_process(self, env_obs, last_action):
-        """Generate 119D feature vector, legal action mask, and scalar reward.
+    def _compute_frontier(self):
+        """Compute frontier features (8D).
 
-        生成 119D 特征向量（49D视野 + 12D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 35D轨迹 + 5D记忆 + 2D BFS）、合法动作掩码和标量奖励。
+        For each of 4 directions (N/E/S/W):
+          [0-3] distance to nearest unexplored/cleanable cell (normalized, 0=near, 1=far)
+          [4-7] whether there is unexplored/cleanable cell in that direction (0/1)
+
+        Returns: (frontier_dists[4D], frontier_exists[4D])
+        """
+        hx, hz = self.cur_pos
+        dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # N E S W
+        max_ray = 20  # 最多往前看 20 步
+        frontier_dists = []
+        frontier_exists = []
+
+        for dx, dz in dirs:
+            x, z = hx, hz
+            found_dist = max_ray
+            found = False
+            for step in range(1, max_ray + 1):
+                x += dx
+                z += dz
+                if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
+                    break
+                rx = x - hx + self.VIEW_HALF
+                rz = z - hz + self.VIEW_HALF
+                if not (0 <= rx < 21 and 0 <= rz < 21):
+                    break
+                cell = self._view_map[int(rx), int(rz)]
+                if cell == 0:
+                    break  # 撞墙
+                if cell == 1 or cell == 2:
+                    found_dist = step
+                    found = True
+                    break
+            frontier_dists.append(_norm(found_dist, max_ray))
+            frontier_exists.append(1.0 if found else 0.0)
+
+        return np.array(frontier_dists, dtype=np.float32), np.array(frontier_exists, dtype=np.float32)
+
+    def _bfs_to_unexplored(self):
+        """BFS to nearest unexplored/cleanable cell.
+
+        Returns: (distance, direction_onehot_8D)
+          distance: float, path length to nearest cleanable cell (256.0 if unreachable)
+          direction: 8D one-hot, best direction to move (index 7 = no target)
+        """
+        max_bfs = 300.0  # 与电池容量匹配
+        hx, hz = self.cur_pos
+
+        if not (0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE):
+            return 256.0, np.zeros(8, dtype=np.float32)
+
+        from collections import deque
+
+        q = deque()
+        q.append((hx, hz, 0))
+        seen = set([(hx, hz)])
+        dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # N E S W
+
+        while q:
+            x, z, d = q.popleft()
+            if d > max_bfs:
+                break
+            nd = d + 1
+            for i, (dx, dz) in enumerate(dirs):
+                nx, nz = x + dx, z + dz
+                if not (0 <= nx < self.GRID_SIZE and 0 <= nz < self.GRID_SIZE):
+                    continue
+                if (nx, nz) in seen:
+                    continue
+                if self.passable_map[nx, nz] == 0:
+                    continue
+                seen.add((nx, nz))
+                rx = nx - hx + self.VIEW_HALF
+                rz = nz - hz + self.VIEW_HALF
+                if 0 <= rx < 21 and 0 <= rz < 21:
+                    cell = self._view_map[int(rx), int(rz)]
+                    if cell == 1 or cell == 2:  # 可清扫
+                        dir_onehot = np.zeros(8, dtype=np.float32)
+                        dir_onehot[i] = 1.0
+                        return float(nd), dir_onehot
+                q.append((nx, nz, nd))
+
+        # 没找到：返回不可达
+        return 256.0, np.zeros(8, dtype=np.float32)
+
+    def _get_exit_count(self):
+        """Get number of open exits around current position (not blocked by wall/NPC).
+
+        Returns: exit count (0-4)
+        """
+        hx, hz = self.cur_pos
+        dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+        exit_count = 0
+        for dx, dz in dirs:
+            nx, nz = hx + dx, hz + dz
+            if not (0 <= nx < self.GRID_SIZE and 0 <= nz < self.GRID_SIZE):
+                continue
+            if self.passable_map[nx, nz] == 0:
+                continue
+            npc_blocked = any(
+                abs(int(n[0]) - nx) <= 1 and abs(int(n[1]) - nz) <= 1
+                for n in self.npcs
+            )
+            if not npc_blocked:
+                exit_count += 1
+        return exit_count
+
+    def feature_process(self, env_obs, last_action):
+        """Generate 144D feature vector, legal action mask, and scalar reward.
+
+        生成 144D 特征向量（49D视野 + 12D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 35D轨迹 + 5D记忆 + 2D BFS + 8D前缘 + 9D未探索目标）、合法动作掩码和标量奖励。
         """
         self.pb2struct(env_obs, last_action)
 
@@ -542,16 +651,37 @@ class Preprocessor:
         legal_action = self.get_legal_action()  # 8D
         legal_arr = np.array(legal_action, dtype=np.float32)
 
-        # Phase1/2 extra features / 新增特征
+        # extra features
         charger_feats = self._charger_feats()  # 4D
         npc_feats = self._npc_feats()  # 4D
         traj_feats = self._traj_feats()  # 35D (K=4 => 32 + 3)
         memory_feats = self._memory_feats()  # 5D
         bfs_feats = self._bfs_feats()  # 2D
 
+        # 方案一：三步能看到的边界特征
+        frontier_dists, frontier_exists = self._compute_frontier()  # 8D (4D距离 + 4D存在标志)
+
+        # 方案三：BFS 到未探索目标
+        bfs_unexplored_dist, bfs_unexplored_dir = self._bfs_to_unexplored()  # 1D + 8D = 9D
+        bfs_unexplored_dist_arr = np.array([_norm(bfs_unexplored_dist, 300.0)], dtype=np.float32)
+
         feature = np.concatenate(
-            [local_view, global_state, legal_arr, charger_feats, npc_feats, traj_feats, memory_feats, bfs_feats]
+            [
+                local_view,       # 49D
+                global_state,     # 12D
+                legal_arr,        # 8D
+                charger_feats,    # 4D
+                npc_feats,        # 4D
+                traj_feats,       # 35D
+                memory_feats,     # 5D
+                bfs_feats,        # 2D
+                frontier_dists,   # 4D
+                frontier_exists,  # 4D
+                bfs_unexplored_dist_arr,  # 1D
+                bfs_unexplored_dir,       # 8D
+            ]
         )
+        # 49+12+8+4+4+35+5+2+4+4+1+8 = 136D
 
         reward = self.reward_process()
 
@@ -559,13 +689,15 @@ class Preprocessor:
 
     def reward_process(self):
         # Weights (充电优先模式) / 权重（充电优先模式）
-        w_clean = 0.03       # 清扫奖励：降低（原0.12），变为次要目标
-        w_charge = 0.05     # 充电奖励：增强（原0.02）
-        w_npc = 0.03        # NPC躲避：保持不变
-        w_new = 0.0005      # 探索新格子：降低（原0.002）
-        w_repeat = 0.0002   # 回环惩罚：降低（原0.0005）
-        w_streak = 0.0005   # 连清奖励：降低（原0.0015）
-        w_idle = 0.0005     # 空跑惩罚：降低（原0.0025）
+        w_clean = 0.05       # 清扫奖励
+        w_charge = 0.05     # 充电奖励
+        w_npc = 0.03        # NPC躲避
+        w_new = 0.0005      # 探索新格子
+        w_repeat = 0.002   # 回环惩罚
+        w_streak = 0.0005   # 连清奖励
+        w_idle = 0.0005     # 空跑惩罚
+        w_frontier = 0.005  # 前缘探索奖励（方案一）
+        w_stuck = 0.01      # 被困惩罚：出口≤1时额外惩罚
 
         # Cleaning reward / 清扫奖励
         self.cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
@@ -580,27 +712,72 @@ class Preprocessor:
 
         streak_cap = 20
         r_streak = w_streak * float(min(self.clean_streak, streak_cap))
-        r_idle = -w_idle if self.cleaned_this_step == 0 else 0.0
 
-        # Explore: new cell reward + repeat penalty / 探索：新格子 + 回环惩罚
+        # === 方案一：被困惩罚 + 前缘探索奖励 ===
+        exit_count = self._get_exit_count()
+        frontier_dists, frontier_exists = self._compute_frontier()
+        bfs_unexplored_dist, _ = self._bfs_to_unexplored()
+
+        # 1. 被困惩罚：当出口≤1时强制激励移动
+        # 用势函数保证连续可微
+        gamma = 0.99
+        self._last_exit_count = exit_count
+
+        # 被困严重度 = max(0, 2 - exit_count) / 2，范围 [0, 1]
+        stuck_severity = float(np.clip((2 - exit_count) / 2.0, 0.0, 1.0))
+        phi_stuck = stuck_severity  # 越被困，势能越高
+        last_phi_stuck = getattr(self, '_last_phi_stuck', 0.0)
+        r_stuck = -gamma * phi_stuck + last_phi_stuck  # 势函数：被困程度降低时给正奖励
+        self._last_phi_stuck = phi_stuck
+        r_stuck *= w_stuck
+
+        # 2. 前缘探索奖励：往有未探索区/污渍的方向走，给势函数奖励
+        hx, hz = self.cur_pos
+        lx, lz = self.last_pos
+        dx = hx - lx
+        dz = hz - lz
+        dir_map = {(0, -1): 0, (1, 0): 1, (0, 1): 2, (-1, 0): 3}
+        curr_dir = dir_map.get((int(dx), int(dz)), -1)
+
+        r_frontier = 0.0
+        if curr_dir >= 0 and frontier_exists[curr_dir] > 0.5:
+            # 正在往有未探索区的方向走：距离越远，势能越低（给正奖励鼓励继续走）
+            # frontier_dists 0=near, 1=far，所以 phi = frontier_dists
+            phi_frontier = frontier_dists[curr_dir]
+            last_phi_frontier = getattr(self, '_last_phi_frontier', 0.0)
+            r_frontier = gamma * phi_frontier - last_phi_frontier
+            self._last_phi_frontier = phi_frontier
+            r_frontier *= w_frontier
+        elif sum(frontier_exists) == 0 and exit_count > 1:
+            # 四方向都没有未探索区但有出路：给中等探索奖励鼓励随机走
+            r_frontier = w_frontier * 0.3
+        elif bfs_unexplored_dist < 300.0 and curr_dir >= 0:
+            # BFS 目标存在：检查是否在接近目标
+            last_bfs_dist = getattr(self, '_last_bfs_unexplored_dist', bfs_unexplored_dist)
+            self._last_bfs_unexplored_dist = bfs_unexplored_dist
+            if bfs_unexplored_dist < last_bfs_dist:
+                # 距离在缩短，给势函数奖励
+                phi_bfs = bfs_unexplored_dist / 300.0
+                last_phi_bfs = getattr(self, '_last_phi_bfs', phi_bfs)
+                r_bfs_approach = gamma * phi_bfs - last_phi_bfs
+                self._last_phi_bfs = phi_bfs
+                r_frontier += r_bfs_approach * w_frontier * 0.5
+
+        # === 原有奖励 ===
+        r_idle = -w_idle if self.cleaned_this_step == 0 else 0.0
         r_new = w_new if self.is_new_cell else 0.0
         r_repeat = -w_repeat * float(self.loop_flag)
 
-        # Charger navigation: potential-based shaping (low battery gated)
-        # 回充导航：势函数差分（始终激活）
-        # gate = 1.0 始终激活，引导智能体始终靠近充电桩
-        gate = 1.0
-        # Prefer BFS path distance if available (Phase2) / 若可用优先用 BFS 路径距离
-        d_bfs_norm = float(np.clip(self.bfs_d_charger / 256.0, 0.0, 1.0))
+        # Charger navigation: potential-based shaping
+        d_bfs_norm = float(np.clip(self.bfs_d_charger / 320.0, 0.0, 1.0))
         d_euc_norm = float(np.clip(self._charger_feats()[0], 0.0, 1.0))
         d_charger_norm = d_bfs_norm if d_bfs_norm < 1.0 else d_euc_norm
         phi = -d_charger_norm
         last_phi = -float(np.clip(self.last_d_charger_norm, 0.0, 1.0))
-        r_charge = w_charge * gate * (phi - last_phi)
+        r_charge = w_charge * (phi - last_phi)
         self.last_d_charger_norm = d_charger_norm
 
-        # Step penalty (分段) / 步数惩罚（分段）
-        # 前期正激励鼓励多走，中期中性，后期负惩罚
+        # Step penalty (分段)
         step = getattr(self, 'step_no', 0)
         if step < 300:
             step_penalty = 0.001
@@ -609,13 +786,16 @@ class Preprocessor:
         else:
             step_penalty = -0.001
 
-        # NPC avoid: soft penalty inside safe radius / NPC 躲避：安全半径内软惩罚
+        # NPC avoid: soft penalty
         safe_radius = 2.5
         d_npc = float(self.d_npc_min)
         s = max(0.0, (safe_radius - d_npc) / safe_radius)
         r_npc = -w_npc * (s * s)
 
-        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + step_penalty)
+        total = float(
+            r_clean + r_charge + r_npc + r_new + r_repeat + r_streak
+            + r_idle + step_penalty + r_stuck + r_frontier
+        )
 
         self.last_reward_components = {
             "cleaning": float(r_clean),
@@ -626,6 +806,8 @@ class Preprocessor:
             "eff_streak": float(r_streak),
             "eff_idle": float(r_idle),
             "step_penalty": float(step_penalty),
+            "stuck_penalty": float(r_stuck),
+            "frontier_reward": float(r_frontier),
             "d_charger_norm": float(d_charger_norm),
             "total": total,
         }
