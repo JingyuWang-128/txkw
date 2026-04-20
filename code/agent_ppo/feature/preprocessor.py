@@ -305,15 +305,15 @@ class Preprocessor:
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
-        """Local view feature (49D): 3×3 stride-3 max pool on 21×21 view.
+        """Local view feature (49D): 3×3 stride-3 mean pool on dirt density (21×21 view).
 
-        局部视野特征（49D）：21×21视野经3×3最大池化压缩为7×7。
+        局部视野特征（49D）：21×21视野经3×3平均池化压缩为7×7（未清扫密度）。
         """
-        view = self._view_map / 2.0
-        # 3×3 stride=3 max pool: 21×21 → 7×7 (纯numpy实现)
-        h, w = view.shape
+        dirt_mask = (self._view_map == 2).astype(np.float32)  # 1 where dirt, 0 else
+        # 3×3 stride=3 mean pool: 21×21 → 7×7 (纯numpy实现)
+        h, w = dirt_mask.shape
         ph, pw = h // 3, w // 3
-        pooled = view[:ph*3, :pw*3].reshape(ph, 3, pw, 3).max(axis=(1, 3))
+        pooled = dirt_mask[:ph*3, :pw*3].reshape(ph, 3, pw, 3).mean(axis=(1, 3))
         return pooled.flatten()
 
     def _get_global_state_feature(self):
@@ -689,15 +689,13 @@ class Preprocessor:
 
     def reward_process(self):
         # Weights (充电优先模式) / 权重（充电优先模式）
-        w_clean = 0.05       # 清扫奖励
-        w_charge = 0.05     # 充电奖励
-        w_npc = 0.03        # NPC躲避
-        w_new = 0.0005      # 探索新格子
-        w_repeat = 0.002   # 回环惩罚
-        w_streak = 0.0005   # 连清奖励
-        w_idle = 0.0005     # 空跑惩罚
-        w_frontier = 0.005  # 前缘探索奖励（方案一）
-        w_stuck = 0.01      # 被困惩罚：出口≤1时额外惩罚
+        w_clean = 0.035       # 清扫奖励：降低（原0.12），变为次要目标
+        w_charge = 0.05     # 充电奖励：增强（原0.02）
+        w_npc = 0.04        # NPC躲避：保持不变
+        w_new = 0.0005      # 探索新格子：降低（原0.002）
+        w_repeat = 0.0002   # 回环惩罚：降低（原0.0005）
+        w_streak = 0.0005   # 连清奖励：降低（原0.0015）
+        w_idle = 0.0005     # 空跑惩罚：降低（原0.0025）
 
         # Cleaning reward / 清扫奖励
         self.cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)

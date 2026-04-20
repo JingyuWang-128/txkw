@@ -16,7 +16,7 @@ class Config:
     # Feature dimensions
     # 特征维度
     FEATURES = [
-        7 * 7,     # local view (原21*21=441 → 池化后49)
+        7 * 7,     # local view (dirt density: 21*21 → 7*7 mean pool)
         12,        # global state
         8,         # legal action
         4,         # charger feats
