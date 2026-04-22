@@ -78,9 +78,10 @@ class Preprocessor:
         self.visited_coarse = set()  # visited coarse bins
         self.recent_positions = []  # sliding window of recent positions
 
-        self.action_hist_k = 4
+        self.action_hist_k = 2
         self.action_hist = [-1] * self.action_hist_k
 
+        self.steps_since_clean = 0  # steps since last successful clean / 距上次清扫步数
         self.clean_streak = 0
         self.idle_steps = 0
         self.idle_window = []  # sliding window: 1=idle step, 0=cleaned step
@@ -99,6 +100,9 @@ class Preprocessor:
         self.loop_flag = 0.0
         self.bfs_d_charger = 256.0
         self.bfs_d_dirt = 256.0
+
+        # Wall collision detection / 撞墙检测
+        self.wall_hit = 0.0  # 1.0 if last move was blocked by obstacle / 上次移动被障碍物阻挡
 
         # Trapped detection / 被困检测
         self.stuck_counter = 0  # consecutive steps with little position change / 连续小范围移动步数
@@ -134,6 +138,12 @@ class Preprocessor:
         self.idle_window.append(0 if _step_cleaned > 0 else 1)
         if len(self.idle_window) > 50:
             self.idle_window = self.idle_window[-50:]
+
+        # Steps since last successful clean / 距上次清扫步数
+        if _step_cleaned > 0:
+            self.steps_since_clean = 0
+        else:
+            self.steps_since_clean += 1
 
         # step_cleaned_cells / 本步清扫格子
         self.step_cleaned_cells = []
@@ -179,6 +189,9 @@ class Preprocessor:
                     self.npcs.append((int(p.get("x", 0)), int(p.get("z", 0))))
                 except Exception:
                     continue
+
+        # Wall collision: agent tried to move but stayed in place / 撞墙检测
+        self.wall_hit = 1.0 if self.step_no > 0 and self.cur_pos == self.last_pos else 0.0
 
         # History: action & visited / 历史：动作与访问记忆
         if last_action is None:
@@ -334,16 +347,23 @@ class Preprocessor:
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
-        """Local view feature (49D): 3×3 stride-3 max pool on 21×21 view.
+        """Local view feature (147D): tri-channel 3×3 avg pool on 21×21 view.
 
-        局部视野特征（49D）：21×21视野经3×3最大池化压缩为7×7。
+        局部视野特征（147D）：21×21视野按三通道分别做3×3平均池化，输出7×7×3=147D。
+        通道顺序: [0]障碍率 [1]已清扫率 [2]污渍率。
+
+        相比单通道max pool的优势：
+          - 能区分"1格污渍+8格障碍"和"1格污渍+8格已清扫"（max pool将两者输出相同）
+          - 障碍率高的块伴随污渍低水平，模型可学会"未必能达，不要去"
         """
-        view = self._view_map / 2.0
-        # 3×3 stride=3 max pool: 21×21 → 7×7 (纯numpy实现)
+        view = self._view_map  # values: 0=obstacle, 1=cleaned, 2=dirt
         h, w = view.shape
         ph, pw = h // 3, w // 3
-        pooled = view[:ph*3, :pw*3].reshape(ph, 3, pw, 3).max(axis=(1, 3))
-        return pooled.flatten()
+        blocks = view[:ph*3, :pw*3].reshape(ph, 3, pw, 3)  # (7, 3, 7, 3)
+        obstacle = (blocks == 0).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
+        cleaned  = (blocks == 1).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
+        dirt     = (blocks == 2).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
+        return np.concatenate([obstacle.flatten(), cleaned.flatten(), dirt.flatten()])  # 147D
 
     def _get_global_state_feature(self):
         """Global state feature (12D).
@@ -354,7 +374,7 @@ class Preprocessor:
           [0]  step_norm         step progress / 步数归一化 [0,1]
           [1]  battery_ratio     battery level / 电量比 [0,1]
           [2]  cleaning_progress cleaned ratio / 已清扫比例 [0,1]
-          [3]  remaining_dirt    remaining dirt ratio / 剩余污渍比例 [0,1]
+          [3]  wall_hit          wall collision last step / 上步是否撞墙 {0,1}
           [4]  pos_x_norm        x position / x 坐标归一化 [0,1]
           [5]  pos_z_norm        z position / z 坐标归一化 [0,1]
           [6]  ray_N_dirt        north ray distance / 向上（z-）方向最近污渍距离
@@ -367,7 +387,6 @@ class Preprocessor:
         step_norm = _norm(self.step_no, 2000)
         battery_ratio = _norm(self.battery, self.battery_max)
         cleaning_progress = _norm(self.dirt_cleaned, self.total_dirt)
-        remaining_dirt = 1.0 - cleaning_progress
 
         hx, hz = self.cur_pos
         pos_x_norm = _norm(hx, self.GRID_SIZE)
@@ -414,7 +433,7 @@ class Preprocessor:
                 step_norm,
                 battery_ratio,
                 cleaning_progress,
-                remaining_dirt,
+                float(self.wall_hit),
                 pos_x_norm,
                 pos_z_norm,
                 ray_dirt[0],
@@ -442,12 +461,48 @@ class Preprocessor:
         dists = np.sqrt((dirt_coords[:, 0] - center) ** 2 + (dirt_coords[:, 1] - center) ** 2)
         return float(np.min(dists))
 
-    def get_legal_action(self):
-        """Return legal action mask (8D list).
+    def _compute_true_legal_action(self):
+        """Compute actual passability for 8 directions from local view map.
 
-        返回合法动作掩码（8D list）。
+        根据局部视野地图计算8个方向的实际可通行性（含斜向防穿角规则）。
+        环境返回的 legal_act 始终全1，此方法提供真实的可通行掩码，防止智能体撞墙浪费步数和电量。
         """
-        return list(self._legal_act)
+        view = self._view_map
+        if view is None or view.shape[0] < 21:
+            return [1] * 8
+
+        cx, cz = self.VIEW_HALF, self.VIEW_HALF  # center (10, 10) = agent
+        # Action -> (dx, dz): 0=右 1=右上 2=上 3=左上 4=左 5=左下 6=下 7=右下
+        dirs = [(1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1)]
+
+        legal = []
+        for dx, dz in dirs:
+            tx, tz = cx + dx, cz + dz
+            # Target cell must be within view and passable (≠0)
+            if not (0 <= tx < 21 and 0 <= tz < 21) or view[tx, tz] == 0:
+                legal.append(0)
+                continue
+            # Diagonal: anti-corner-cutting (至少一个正交邻居可通行)
+            if abs(dx) == 1 and abs(dz) == 1:
+                h_pass = view[cx + dx, cz] != 0  # horizontal neighbor
+                v_pass = view[cx, cz + dz] != 0  # vertical neighbor
+                if not h_pass and not v_pass:
+                    legal.append(0)
+                    continue
+            legal.append(1)
+
+        # Fallback: if all blocked, allow all to avoid softmax NaN / 全封时允许全部
+        if sum(legal) == 0:
+            return [1] * 8
+        return legal
+
+    def get_legal_action(self):
+        """Return true legal action mask (8D list) computed from local view.
+
+        返回基于视野地图计算的真实合法动作掩码（8D list）。
+        不可通行方向将被策略网络自动屏蔽，智能体永远不会选择撞墙动作。
+        """
+        return self._compute_true_legal_action()
 
     def _action_hist_onehot(self):
         """One-hot encode last K actions (K*8). Invalid (-1) -> all zeros."""
@@ -483,10 +538,11 @@ class Preprocessor:
         dx_norm = float(np.clip(dx / max_d, -1.0, 1.0))
         dz_norm = float(np.clip(dz / max_d, -1.0, 1.0))
 
-        battery_ratio = _norm(self.battery, self.battery_max)
-        thr = 0.35
-        low_battery_gate = float(np.clip((thr - battery_ratio) / max(thr, 1e-6), 0.0, 1.0))
-        return np.array([d_norm, dx_norm, dz_norm, low_battery_gate], dtype=np.float32)
+        # Urgency gate: battery_max independent (same logic as bfs_feats)
+        # 充电紧迫度：与 battery_max 无关，仅看电量与充电桩BFS距离比
+        reach_r = self.battery / max(self.bfs_d_charger, 1.0)
+        charge_urgency = float(np.clip((2.0 - reach_r) / 2.0, 0.0, 1.0))
+        return np.array([d_norm, dx_norm, dz_norm, charge_urgency], dtype=np.float32)
 
     def _npc_feats(self):
         max_d = 50.0
@@ -531,14 +587,14 @@ class Preprocessor:
         )
 
     def _memory_feats(self):
-        """Memory feature (5D): coverage, recent_coverage, cleaned_norm, est_steps_remaining, idle_norm.
+        """Memory feature (5D): coverage, recent_coverage, cleaned_norm, steps_since_clean_norm, idle_norm.
 
-        记忆特征（5D）：覆盖率、最近覆盖率、清扫格数、预计剩余步数、最近50步空闲比率。
+        记忆特征（5D）：覆盖率、最近覆盖率、清扫格数、距上次清扫步数、最近50步空闲比率。
         """
         cleaned_cnt = float(len(self.step_cleaned_cells))
         cleaned_norm = float(np.clip(cleaned_cnt / 10.0, 0.0, 1.0))
-        # 预计剩余步数：基于当前电量估算（假设满电可走1000步）
-        est_steps_remaining = float(np.clip(self.battery / max(self.battery_max / 1000.0, 1e-6), 0.0, 1000.0)) / 1000.0
+        # 距上次成功清扫的步数（归一化，cap=50）— 与 battery_max 无关
+        steps_since_clean_norm = float(np.clip(self.steps_since_clean / 50.0, 0.0, 1.0))
         # 最近50步空闲比率（滑动窗口）
         idle_norm = float(sum(self.idle_window)) / max(len(self.idle_window), 1)
         return np.array(
@@ -546,27 +602,40 @@ class Preprocessor:
                 float(np.clip(self.coverage_ratio, 0.0, 1.0)),
                 float(np.clip(self.recent_coverage, 0.0, 1.0)),
                 cleaned_norm,
-                est_steps_remaining,
+                steps_since_clean_norm,
                 idle_norm,
             ],
             dtype=np.float32,
         )
 
     def _bfs_feats(self):
-        # BFS distances (path length) normalized
+        """BFS features (4D): charger_dist, dirt_dist, reach_ratio, urgency.
+
+        BFS特征（4D）：充电桩距离、污渍距离、电量/距离比、充电紧迫度。
+        reach_ratio 和 urgency 完全不依赖 battery_max，仅看 battery vs bfs_d_charger，
+        因此模型可在任意 battery_max（100~999）下做出正确的回充决策。
+        """
         max_bfs = 256.0
         d_ch = float(np.clip(self.bfs_d_charger, 0.0, max_bfs))
         d_di = float(np.clip(self.bfs_d_dirt, 0.0, max_bfs))
-        return np.array([d_ch / max_bfs, d_di / max_bfs], dtype=np.float32)
+        # reach_ratio: how many trips to charger the battery can afford (battery_max independent)
+        # 电量够跑几趟充电桩（与 battery_max 完全无关）
+        reach_ratio = float(np.clip(
+            self.battery / max(self.bfs_d_charger, 1.0), 0.0, 5.0
+        )) / 5.0  # normalized to [0, 1]
+        # urgency: binary signal — must head to charger NOW (battery_max independent)
+        # 二值紧迫信号 — 电量仅够1.5倍距离时触发（与 battery_max 完全无关）
+        urgency = 1.0 if self.battery <= self.bfs_d_charger * 1.5 else 0.0
+        return np.array([d_ch / max_bfs, d_di / max_bfs, reach_ratio, urgency], dtype=np.float32)
 
     def feature_process(self, env_obs, last_action):
-        """Generate 119D feature vector, legal action mask, and scalar reward.
+        """Generate 203D feature vector, legal action mask, and scalar reward.
 
-        生成 119D 特征向量（49D视野 + 12D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 35D轨迹 + 5D记忆 + 2D BFS）、合法动作掩码和标量奖励。
+        生成 203D 特征向量（147D视野 + 12D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 19D轨迹 + 5D记忆 + 4D BFS）、合法动作掩码和标量奖励。
         """
         self.pb2struct(env_obs, last_action)
 
-        local_view = self._get_local_view_feature()  # 49D
+        local_view = self._get_local_view_feature()  # 147D (obstacle+cleaned+dirt each 7x7)
         global_state = self._get_global_state_feature()  # 12D
         legal_action = self.get_legal_action()  # 8D
         legal_arr = np.array(legal_action, dtype=np.float32)
@@ -574,9 +643,9 @@ class Preprocessor:
         # Phase1/2 extra features / 新增特征
         charger_feats = self._charger_feats()  # 4D
         npc_feats = self._npc_feats()  # 4D
-        traj_feats = self._traj_feats()  # 35D (K=4 => 32 + 3)
+        traj_feats = self._traj_feats()  # 19D (K=2 => 16 + 3)
         memory_feats = self._memory_feats()  # 5D
-        bfs_feats = self._bfs_feats()  # 2D
+        bfs_feats = self._bfs_feats()  # 4D
 
         feature = np.concatenate(
             [local_view, global_state, legal_arr, charger_feats, npc_feats, traj_feats, memory_feats, bfs_feats]
@@ -615,11 +684,10 @@ class Preprocessor:
         r_new = w_new if self.is_new_cell else 0.0
         r_repeat = -w_repeat * float(self.loop_flag)
 
-        # Charger navigation: potential-based shaping (low battery gated)
-        # 回充导航：势函数差分（低电量门控，避免始终绕充电桩）
-        battery_ratio = _norm(self.battery, self.battery_max)
-        thr = 0.35
-        gate = float(np.clip((thr - battery_ratio) / max(thr, 1e-6), 0.0, 1.0))
+        # Charger navigation: potential-based shaping (low battery gated, battery_max independent)
+        # 回充导航：势函数差分（低电量门控，与 battery_max 无关）
+        reach_r = self.battery / max(self.bfs_d_charger, 1.0)
+        gate = float(np.clip((2.0 - reach_r) / 2.0, 0.0, 1.0))
         # Prefer BFS path distance if available (Phase2) / 若可用优先用 BFS 路径距离
         d_bfs_norm = float(np.clip(self.bfs_d_charger / 256.0, 0.0, 1.0))
         d_euc_norm = float(np.clip(self._charger_feats()[0], 0.0, 1.0))
@@ -658,7 +726,10 @@ class Preprocessor:
             pos_dist = float(np.sqrt((self.cur_pos[0] - self.last_escape_pos[0])**2 + (self.cur_pos[1] - self.last_escape_pos[1])**2))
             r_escape = 0.01 * min(pos_dist / 10.0, 1.0)  # reward proportional to escape progress
 
-        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_escape + step_penalty)
+        # Wall collision penalty: wasted step + battery / 撞墙惩罚：浪费步数+电量
+        wall_penalty = -0.02 * self.wall_hit
+
+        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_escape + step_penalty + wall_penalty)
 
         self.last_reward_components = {
             "cleaning": float(r_clean),
@@ -670,6 +741,7 @@ class Preprocessor:
             "eff_idle": float(r_idle),
             "escape": float(r_escape),
             "step_penalty": float(step_penalty),
+            "wall_penalty": float(wall_penalty),
             "d_charger_norm": float(d_charger_norm),
             "total": total,
         }
