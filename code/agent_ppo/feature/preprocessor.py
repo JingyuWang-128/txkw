@@ -78,7 +78,7 @@ class Preprocessor:
         self.visited_coarse = set()  # visited coarse bins
         self.recent_positions = []  # sliding window of recent positions
 
-        self.action_hist_k = 2
+        self.action_hist_k = 1
         self.action_hist = [-1] * self.action_hist_k
 
         self.steps_since_clean = 0  # steps since last successful clean / 距上次清扫步数
@@ -347,28 +347,24 @@ class Preprocessor:
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
-        """Local view feature (147D): tri-channel 3×3 avg pool on 21×21 view.
+        """Local view feature (98D): dual-channel 3×3 avg pool on 21×21 view.
 
-        局部视野特征（147D）：21×21视野按三通道分别做3×3平均池化，输出7×7×3=147D。
-        通道顺序: [0]障碍率 [1]已清扫率 [2]污渍率。
-
-        相比单通道max pool的优势：
-          - 能区分"1格污渍+8格障碍"和"1格污渍+8格已清扫"（max pool将两者输出相同）
-          - 障碍率高的块伴随污渍低水平，模型可学会"未必能达，不要去"
+        局部视野特征（98D）：21×21视野按双通道做3×3平均池化，输出7×7×2=98D。
+        通道: [0]障碍率 [1]污渍率。
+        已清扫率 = 1 - 障碍率 - 污渍率，线性冗余故省略。
         """
         view = self._view_map  # values: 0=obstacle, 1=cleaned, 2=dirt
         h, w = view.shape
         ph, pw = h // 3, w // 3
         blocks = view[:ph*3, :pw*3].reshape(ph, 3, pw, 3)  # (7, 3, 7, 3)
         obstacle = (blocks == 0).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
-        cleaned  = (blocks == 1).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
         dirt     = (blocks == 2).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
-        return np.concatenate([obstacle.flatten(), cleaned.flatten(), dirt.flatten()])  # 147D
+        return np.concatenate([obstacle.flatten(), dirt.flatten()])  # 98D
 
     def _get_global_state_feature(self):
-        """Global state feature (12D).
+        """Global state feature (6D).
 
-        全局状态特征（12D）。
+        全局状态特征（6D）。
 
         Dimensions / 维度说明：
           [0]  step_norm         step progress / 步数归一化 [0,1]
@@ -377,12 +373,6 @@ class Preprocessor:
           [3]  wall_hit          wall collision last step / 上步是否撞墙 {0,1}
           [4]  pos_x_norm        x position / x 坐标归一化 [0,1]
           [5]  pos_z_norm        z position / z 坐标归一化 [0,1]
-          [6]  ray_N_dirt        north ray distance / 向上（z-）方向最近污渍距离
-          [7]  ray_E_dirt        east ray distance / 向右（x+）方向
-          [8]  ray_S_dirt        south ray distance / 向下（z+）方向
-          [9]  ray_W_dirt        west ray distance / 向左（x-）方向
-          [10] nearest_dirt_norm nearest dirt Euclidean distance / 最近污渍欧氏距离归一化
-          [11] dirt_delta        approaching dirt indicator / 是否在接近污渍（1=是, 0=否）
         """
         step_norm = _norm(self.step_no, 2000)
         battery_ratio = _norm(self.battery, self.battery_max)
@@ -392,42 +382,6 @@ class Preprocessor:
         pos_x_norm = _norm(hx, self.GRID_SIZE)
         pos_z_norm = _norm(hz, self.GRID_SIZE)
 
-        # 4-directional ray to find nearest dirt
-        # 四方向射线找最近污渍距离
-        ray_dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # N E S W
-        ray_dirt = []
-        max_ray = 30
-        for dx, dz in ray_dirs:
-            x, z = hx, hz
-            found = max_ray
-            for step in range(1, max_ray + 1):
-                x += dx
-                z += dz
-                if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
-                    break
-                if self._view_map is not None:
-                    cell = (
-                        int(
-                            self._view_map[
-                                np.clip(x - (hx - self.VIEW_HALF), 0, 20), np.clip(z - (hz - self.VIEW_HALF), 0, 20)
-                            ]
-                        )
-                        if (0 <= x - hx + self.VIEW_HALF < 21 and 0 <= z - hz + self.VIEW_HALF < 21)
-                        else 0
-                    )
-                    if cell == 2:
-                        found = step
-                        break
-            ray_dirt.append(_norm(found, max_ray))
-
-        # Nearest dirt Euclidean distance (estimated from full 21×21 view)
-        # 最近污渍欧氏距离（完整21×21视野内估算）
-        self.last_nearest_dirt_dist = self.nearest_dirt_dist
-        self.nearest_dirt_dist = self._calc_nearest_dirt_dist()
-        nearest_dirt_norm = _norm(self.nearest_dirt_dist, 180)
-
-        dirt_delta = 1.0 if self.nearest_dirt_dist < self.last_nearest_dirt_dist else 0.0
-
         return np.array(
             [
                 step_norm,
@@ -436,12 +390,6 @@ class Preprocessor:
                 float(self.wall_hit),
                 pos_x_norm,
                 pos_z_norm,
-                ray_dirt[0],
-                ray_dirt[1],
-                ray_dirt[2],
-                ray_dirt[3],
-                nearest_dirt_norm,
-                dirt_delta,
             ],
             dtype=np.float32,
         )
@@ -629,21 +577,21 @@ class Preprocessor:
         return np.array([d_ch / max_bfs, d_di / max_bfs, reach_ratio, urgency], dtype=np.float32)
 
     def feature_process(self, env_obs, last_action):
-        """Generate 203D feature vector, legal action mask, and scalar reward.
+        """Generate 140D feature vector, legal action mask, and scalar reward.
 
-        生成 203D 特征向量（147D视野 + 12D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 19D轨迹 + 5D记忆 + 4D BFS）、合法动作掩码和标量奖励。
+        生成 140D 特征向量（98D视野 + 6D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 11D轨迹 + 5D记忆 + 4D BFS）、合法动作掩码和标量奖励。
         """
         self.pb2struct(env_obs, last_action)
 
-        local_view = self._get_local_view_feature()  # 147D (obstacle+cleaned+dirt each 7x7)
-        global_state = self._get_global_state_feature()  # 12D
+        local_view = self._get_local_view_feature()  # 98D (obstacle+dirt each 7x7)
+        global_state = self._get_global_state_feature()  # 6D
         legal_action = self.get_legal_action()  # 8D
         legal_arr = np.array(legal_action, dtype=np.float32)
 
         # Phase1/2 extra features / 新增特征
         charger_feats = self._charger_feats()  # 4D
         npc_feats = self._npc_feats()  # 4D
-        traj_feats = self._traj_feats()  # 19D (K=2 => 16 + 3)
+        traj_feats = self._traj_feats()  # 11D (K=1 => 8 + 3)
         memory_feats = self._memory_feats()  # 5D
         bfs_feats = self._bfs_feats()  # 4D
 

@@ -16,12 +16,12 @@ class Config:
     # Feature dimensions
     # 特征维度
     FEATURES = [
-        3 * 7 * 7, # local view: tri-channel avg pool (obstacle/cleaned/dirt) 21×21→7×7×3=147
-        12,        # global state
+        2 * 7 * 7, # local view: dual-channel avg pool (obstacle/dirt) 21×21→7×7×2=98
+        6,         # global state
         8,         # legal action
         4,         # charger feats
         4,         # npc feats
-        19,        # traj feats (K=2 => 16 + dx/dz + loop)
+        11,        # traj feats (K=1 => 8 + dx/dz + loop)
         5,         # memory feats (原3 → 5)
         4,         # bfs feats (charger_dist + dirt_dist + reach_ratio + urgency)
     ]

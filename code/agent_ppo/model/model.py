@@ -38,22 +38,22 @@ class Model(nn.Module):
         self.model_name = "robot_vacuum"
         self.device = device
 
-        obs_dim = Config.DIM_OF_OBSERVATION  # 203
+        obs_dim = Config.DIM_OF_OBSERVATION  # 140
         act_num = Config.ACTION_NUM  # 8
 
         # Shared backbone / 共享骨干网络
         self.backbone = nn.Sequential(
-            _make_fc(obs_dim, 256),
+            _make_fc(obs_dim, 192),
             nn.ReLU(),
-            _make_fc(256, 128),
+            _make_fc(192, 96),
             nn.ReLU(),
         )
 
         # Actor head: outputs action logits / 策略头：输出动作 logits
-        self.actor_head = _make_fc(128, act_num, gain=0.01)
+        self.actor_head = _make_fc(96, act_num, gain=0.01)
 
         # Critic head: outputs single state value / 价值头：输出单个状态价值
-        self.critic_head = _make_fc(128, 1, gain=0.01)
+        self.critic_head = _make_fc(96, 1, gain=0.01)
 
     def forward(self, s, inference=False):
         """Forward pass.
