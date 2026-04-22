@@ -159,10 +159,18 @@ class EpisodeRunner:
                         final_reward = 5.0 + 5.0 * cleaning_ratio
                         result_str = "WIN"
                     else:
-                        # Early termination (battery depleted or collision): small penalty
-                        # 提前结束（电量耗尽或碰撞）：小惩罚
-                        final_reward = -2.0
-                        result_str = "FAIL"
+                        # Early termination (battery depleted or collision): distinguish penalty
+                        # 提前结束（电量耗尽或碰撞）：区分惩罚
+                        if ep_min_npc_dist < 0.5:
+                            # NPC collision: severe penalty
+                            # NPC碰撞：严重惩罚
+                            final_reward = -10.0
+                            result_str = "NPC_COLLISION"
+                        else:
+                            # Battery depleted or other early termination
+                            # 电量耗尽或其他提前结束
+                            final_reward = -2.0
+                            result_str = "FAIL"
 
                     comp_str = " ".join(
                         [f"{k}:{ep_reward_comps.get(k, 0.0):.3f}" for k in sorted(ep_reward_comps.keys())]

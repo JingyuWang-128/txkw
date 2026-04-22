@@ -11,6 +11,7 @@ Feature preprocessor for Robot Vacuum.
 """
 
 import numpy as np
+from collections import deque
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -44,8 +45,8 @@ class Preprocessor:
         对局开始时重置所有状态。
         """
         self.step_no = 0
-        self.battery = 600
-        self.battery_max = 600
+        self.battery = 200
+        self.battery_max = 200
 
         self.cur_pos = (0, 0)
 
@@ -82,6 +83,7 @@ class Preprocessor:
 
         self.clean_streak = 0
         self.idle_steps = 0
+        self.idle_window = []  # sliding window: 1=idle step, 0=cleaned step
         self.charge_count = 0
 
         self.last_d_charger_norm = 1.0
@@ -97,6 +99,11 @@ class Preprocessor:
         self.loop_flag = 0.0
         self.bfs_d_charger = 256.0
         self.bfs_d_dirt = 256.0
+
+        # Trapped detection / 被困检测
+        self.stuck_counter = 0  # consecutive steps with little position change / 连续小范围移动步数
+        self.escape_mode = False  # escape mode flag / 突围模式标志
+        self.last_escape_pos = (0, 0)  # last position that broke out / 上次突围位置
 
     def pb2struct(self, env_obs, last_action):
         """Parse and cache essential fields from observation dict.
@@ -121,6 +128,12 @@ class Preprocessor:
         self.last_dirt_cleaned = self.dirt_cleaned
         self.dirt_cleaned = int(hero["dirt_cleaned"])
         self.total_dirt = max(int(env_info["total_dirt"]), 1)
+
+        # Update idle sliding window for _memory_feats / 更新idle滑动窗口
+        _step_cleaned = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
+        self.idle_window.append(0 if _step_cleaned > 0 else 1)
+        if len(self.idle_window) > 50:
+            self.idle_window = self.idle_window[-50:]
 
         # step_cleaned_cells / 本步清扫格子
         self.step_cleaned_cells = []
@@ -151,7 +164,9 @@ class Preprocessor:
                     if int(o.get("sub_type", -1)) != 1:
                         continue
                     p = o.get("pos", {})
-                    self.chargers.append((int(p.get("x", 0)), int(p.get("z", 0))))
+                    # Position is the top-left of the 3×3 charger area; +1 to get center
+                    # OrganState的Position为3×3充电桩左上角坐标，+1修正为中心点
+                    self.chargers.append((int(p.get("x", 0)) + 1, int(p.get("z", 0)) + 1))
                 except Exception:
                     continue
 
@@ -204,6 +219,22 @@ class Preprocessor:
         self.bfs_d_charger = self._calc_bfs_to_charger()
         self.bfs_d_dirt = self._calc_bfs_to_local_dirt()
 
+        # Trapped detection: track if agent is moving in small circle / 被困检测：检测是否在小范围转圈
+        pos_dist = float(np.sqrt((hx - self.last_escape_pos[0])**2 + (hz - self.last_escape_pos[1])**2))
+        if pos_dist < 3.0:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+            self.last_escape_pos = (hx, hz)
+
+        # Enter escape mode if stuck for many consecutive steps / 连续多步被困则进入突围模式
+        if self.stuck_counter >= 15:
+            self.escape_mode = True
+        # Exit escape mode once agent moved significantly / 移动超过一定距离则退出突围模式
+        if self.escape_mode and pos_dist >= 10.0:
+            self.escape_mode = False
+            self.stuck_counter = 0
+
     def _calc_nearest_entity_dist(self, entities):
         """Nearest Euclidean distance to a set of (x,z) entities."""
         if not entities:
@@ -228,8 +259,6 @@ class Preprocessor:
             return 256.0
         if self.passable_map[sx, sz] == 0:
             return 256.0
-
-        from collections import deque
 
         q = deque()
         q.append((sx, sz, 0))
@@ -372,8 +401,8 @@ class Preprocessor:
                         break
             ray_dirt.append(_norm(found, max_ray))
 
-        # Nearest dirt Euclidean distance (estimated from 7×7 crop)
-        # 最近污渍欧氏距离（视野内 7×7 粗估）
+        # Nearest dirt Euclidean distance (estimated from full 21×21 view)
+        # 最近污渍欧氏距离（完整21×21视野内估算）
         self.last_nearest_dirt_dist = self.nearest_dirt_dist
         self.nearest_dirt_dist = self._calc_nearest_dirt_dist()
         nearest_dirt_norm = _norm(self.nearest_dirt_dist, 180)
@@ -504,14 +533,14 @@ class Preprocessor:
     def _memory_feats(self):
         """Memory feature (5D): coverage, recent_coverage, cleaned_norm, est_steps_remaining, idle_norm.
 
-        记忆特征（5D）：覆盖率、最近覆盖率、清扫格数、预计剩余步数、连续idle归一化。
+        记忆特征（5D）：覆盖率、最近覆盖率、清扫格数、预计剩余步数、最近50步空闲比率。
         """
         cleaned_cnt = float(len(self.step_cleaned_cells))
         cleaned_norm = float(np.clip(cleaned_cnt / 10.0, 0.0, 1.0))
         # 预计剩余步数：基于当前电量估算（假设满电可走1000步）
         est_steps_remaining = float(np.clip(self.battery / max(self.battery_max / 1000.0, 1e-6), 0.0, 1000.0)) / 1000.0
-        # 连续idle步数（归一化）
-        idle_norm = float(np.clip(self.idle_steps / 50.0, 0.0, 1.0))
+        # 最近50步空闲比率（滑动窗口）
+        idle_norm = float(sum(self.idle_window)) / max(len(self.idle_window), 1)
         return np.array(
             [
                 float(np.clip(self.coverage_ratio, 0.0, 1.0)),
@@ -558,14 +587,14 @@ class Preprocessor:
         return feature, legal_action, reward
 
     def reward_process(self):
-        # Weights (充电优先模式) / 权重（充电优先模式）
-        w_clean = 0.03       # 清扫奖励：降低（原0.12），变为次要目标
-        w_charge = 0.05     # 充电奖励：增强（原0.02）
-        w_npc = 0.03        # NPC躲避：保持不变
-        w_new = 0.0005      # 探索新格子：降低（原0.002）
-        w_repeat = 0.0002   # 回环惩罚：降低（原0.0005）
-        w_streak = 0.0005   # 连清奖励：降低（原0.0015）
-        w_idle = 0.0005     # 空跑惩罚：降低（原0.0025）
+        # Weights (清扫优先模式) / 权重（清扫为主要目标，充电低电量门控）
+        w_clean = 0.10       # 清扫奖励：恢复为主要目标（原0.03）
+        w_charge = 0.08      # 充电奖励：低电量门控激活（原0.05始终激活）
+        w_npc = 0.03         # NPC躲避：保持不变
+        w_new = 0.002        # 探索新格子：适当提升（原0.0005）
+        w_repeat = 0.0005    # 回环惩罚：适当提升（原0.0002）
+        w_streak = 0.001     # 连清奖励：适当提升（原0.0005）
+        w_idle = 0.001       # 空跑惩罚：适当提升（原0.0005）
 
         # Cleaning reward / 清扫奖励
         self.cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
@@ -587,9 +616,10 @@ class Preprocessor:
         r_repeat = -w_repeat * float(self.loop_flag)
 
         # Charger navigation: potential-based shaping (low battery gated)
-        # 回充导航：势函数差分（始终激活）
-        # gate = 1.0 始终激活，引导智能体始终靠近充电桩
-        gate = 1.0
+        # 回充导航：势函数差分（低电量门控，避免始终绕充电桩）
+        battery_ratio = _norm(self.battery, self.battery_max)
+        thr = 0.35
+        gate = float(np.clip((thr - battery_ratio) / max(thr, 1e-6), 0.0, 1.0))
         # Prefer BFS path distance if available (Phase2) / 若可用优先用 BFS 路径距离
         d_bfs_norm = float(np.clip(self.bfs_d_charger / 256.0, 0.0, 1.0))
         d_euc_norm = float(np.clip(self._charger_feats()[0], 0.0, 1.0))
@@ -610,12 +640,25 @@ class Preprocessor:
             step_penalty = -0.001
 
         # NPC avoid: soft penalty inside safe radius / NPC 躲避：安全半径内软惩罚
-        safe_radius = 2.5
+        safe_radius = 4.0
         d_npc = float(self.d_npc_min)
         s = max(0.0, (safe_radius - d_npc) / safe_radius)
         r_npc = -w_npc * (s * s)
 
-        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + step_penalty)
+        # Extra severe penalty when extremely close to NPC / 极近距离额外惩罚
+        if d_npc < 1.0:
+            r_npc = min(r_npc, -0.5)
+
+        # Escape mode: reduce NPC penalty and add escape reward / 突围模式：降低NPC惩罚并添加突围奖励
+        r_escape = 0.0
+        if self.escape_mode:
+            # In escape mode, allow crossing NPC to get out / 突围模式下允许穿越NPC
+            r_npc = r_npc * 0.3
+            # Reward for moving away from stuck position / 奖励远离被困位置
+            pos_dist = float(np.sqrt((self.cur_pos[0] - self.last_escape_pos[0])**2 + (self.cur_pos[1] - self.last_escape_pos[1])**2))
+            r_escape = 0.01 * min(pos_dist / 10.0, 1.0)  # reward proportional to escape progress
+
+        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_escape + step_penalty)
 
         self.last_reward_components = {
             "cleaning": float(r_clean),
@@ -625,6 +668,7 @@ class Preprocessor:
             "explore_repeat": float(r_repeat),
             "eff_streak": float(r_streak),
             "eff_idle": float(r_idle),
+            "escape": float(r_escape),
             "step_penalty": float(step_penalty),
             "d_charger_norm": float(d_charger_norm),
             "total": total,
