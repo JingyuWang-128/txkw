@@ -89,6 +89,7 @@ class Preprocessor:
 
         self.last_d_charger_norm = 1.0
         self.last_reward_components = {}
+        self.last_coverage_ratio = 0.0  # Track coverage change for reward
 
         # cached step metrics
         self.d_charger = 200.0
@@ -215,10 +216,24 @@ class Preprocessor:
         uniq_recent = len(set(self.recent_positions))
         self.recent_coverage = float(uniq_recent / max(1, len(self.recent_positions)))
 
-        # loop flag (returned to a recent position)
-        recent_window = 20
-        recent = self.recent_positions[-recent_window:]
-        self.loop_flag = 1.0 if len(recent) >= 2 and recent.count((hx, hz)) >= 2 else 0.0
+        # loop flag: multi-dimensional loop detection / 回环标志：多维度回环检测
+        # 1. Exact repeat: visited same cell in recent 20 steps / 精确回环：20步内重复访问同一格子
+        recent_window_short = 20
+        recent_short = self.recent_positions[-recent_window_short:] if len(self.recent_positions) >= recent_window_short else self.recent_positions
+        loop_exact = 1.0 if len(recent_short) >= 2 and recent_short.count((hx, hz)) >= 2 else 0.0
+        
+        # 2. Zigzag pattern: high repetition rate in 50-step window / 之字形走位：50步内高重复率
+        recent_window_long = 50
+        recent_long = self.recent_positions[-recent_window_long:] if len(self.recent_positions) >= recent_window_long else self.recent_positions
+        if len(recent_long) > 10:
+            unique_count = len(set(recent_long))
+            repetition_ratio = 1.0 - (unique_count / len(recent_long))
+            loop_zigzag = 1.0 if repetition_ratio > 0.7 else 0.0
+        else:
+            loop_zigzag = 0.0
+        
+        # Take maximum of both detections / 取两个检测的最大值
+        self.loop_flag = max(loop_exact, loop_zigzag)
 
         # charge count heuristic: battery increased (e.g., charging)
         if self.battery > self.last_battery + 5:
@@ -232,18 +247,44 @@ class Preprocessor:
         self.bfs_d_charger = self._calc_bfs_to_charger()
         self.bfs_d_dirt = self._calc_bfs_to_local_dirt()
 
-        # Trapped detection: track if agent is moving in small circle / 被困检测：检测是否在小范围转圈
+        # Enhanced trapped detection: multi-dimensional / 增强被嚰検测：多维度判断
         pos_dist = float(np.sqrt((hx - self.last_escape_pos[0])**2 + (hz - self.last_escape_pos[1])**2))
-        if pos_dist < 3.0:
+        
+        # 1. Position change detection / 位置変化检测
+        position_change_low = pos_dist < 3.0
+        
+        # 2. Efficiency detection: steps vs new cells / 效率检测：步數 vs 新格子
+        efficiency_low = False
+        if self.step_no > 50:
+            steps_per_new = self.step_no / max(len(self.visited), 1)
+            efficiency_low = steps_per_new > 60  # 60 steps for only 1 new cell
+        
+        # 3. Movement speed detection / 速度检测：平均移动距离
+        speed_low = False
+        if len(self.recent_positions) > 20:
+            recent_path = self.recent_positions[-20:]
+            total_dist = sum([
+                np.sqrt((recent_path[i][0]-recent_path[i-1][0])**2 + 
+                       (recent_path[i][1]-recent_path[i-1][1])**2)
+                for i in range(1, len(recent_path))
+            ])
+            avg_speed = total_dist / len(recent_path)
+            speed_low = avg_speed < 1.5
+        
+        # Update stuck counter based on multi-dimensional detection / 根据多维度检测更新被嚰计数
+        if position_change_low or speed_low:
             self.stuck_counter += 1
         else:
             self.stuck_counter = 0
             self.last_escape_pos = (hx, hz)
-
-        # Enter escape mode if stuck for many consecutive steps / 连续多步被困则进入突围模式
-        if self.stuck_counter >= 15:
+        
+        # Enter escape mode: multiple conditions / 进入突囲模式：多条件
+        should_escape = (self.stuck_counter >= 15 or efficiency_low)
+        if should_escape and not self.escape_mode:
             self.escape_mode = True
-        # Exit escape mode once agent moved significantly / 移动超过一定距离则退出突围模式
+            self.last_escape_pos = (hx, hz)
+        
+        # Exit escape mode / 退出突囲模式
         if self.escape_mode and pos_dist >= 10.0:
             self.escape_mode = False
             self.stuck_counter = 0
@@ -299,8 +340,13 @@ class Preprocessor:
         return 256.0
 
     def _calc_bfs_to_charger(self):
+        """Calculate BFS distance to nearest charger with fallback.
+        
+        计算到最近充电桩的BFS距离，支持回退到欧氏距离。
+        """
         if not self.chargers:
             return 256.0
+        
         # organs size w=h=3, treat as 3x3 area around center / 充电桩占 3x3
         targets = set()
         for (x, z) in self.chargers:
@@ -309,7 +355,16 @@ class Preprocessor:
                     tx, tz = int(x + dx), int(z + dz)
                     if 0 <= tx < self.GRID_SIZE and 0 <= tz < self.GRID_SIZE:
                         targets.add((tx, tz))
-        return self._bfs_distance(self.cur_pos, targets)
+        
+        bfs_result = self._bfs_distance(self.cur_pos, targets)
+        
+        # If BFS returns unreachable (256), fallback to Euclidean distance
+        if bfs_result >= 256.0:
+            hx, hz = self.cur_pos
+            euc_dists = [np.sqrt((x-hx)**2 + (z-hz)**2) for x, z in self.chargers]
+            bfs_result = min(euc_dists) if euc_dists else 256.0
+        
+        return min(bfs_result, 256.0)
 
     def _calc_bfs_to_local_dirt(self):
         view = self._view_map
@@ -604,15 +659,40 @@ class Preprocessor:
         return feature, legal_action, reward
 
     def reward_process(self):
-        # Weights (清扫优先模式) / 权重（清扫为主要目标，充电低电量门控）
-        w_clean = 0.10       # 清扫奖励：恢复为主要目标（原0.03）
-        w_charge = 0.08      # 充电奖励：低电量门控激活（原0.05始终激活）
-        w_npc = 0.03         # NPC躲避：保持不变
-        w_new = 0.002        # 探索新格子：适当提升（原0.0005）
-        w_repeat = 0.0005    # 回环惩罚：适当提升（原0.0002）
-        w_streak = 0.001     # 连清奖励：适当提升（原0.0005）
-        w_idle = 0.001       # 空跑惩罚：适当提升（原0.0005）
-
+        """Comprehensive reward shaping with phase-based weight scheduling.
+        
+        综合客体化奖励，根据阶段轮流调整权重。
+        """
+        # Phase-based weight scheduling / 阶段化权重调度
+        step = self.step_no
+        
+        if step < 1000:  # Early phase: encourage exploration
+            w_clean   = 0.04
+            w_charge  = 0.05
+            w_npc     = 0.03
+            w_new     = 0.015  # 7.5x increase from 0.002
+            w_repeat  = 0.002  # 4x increase from 0.0005
+            w_streak  = 0.001
+            w_idle    = 0.001
+        
+        elif step < 1800:  # Middle phase: balance exploration and cleaning
+            w_clean   = 0.03
+            w_charge  = 0.04  # 1.5x increase from 0.08
+            w_npc     = 0.03
+            w_new     = 0.008  # Still encouraged but lower than early
+            w_repeat  = 0.002
+            w_streak  = 0.001
+            w_idle    = 0.001
+        
+        else:  # Late phase: focus on cleaning and efficiency
+            w_clean   = 0.03
+            w_charge  = 0.03
+            w_npc     = 0.04
+            w_new     = 0.002  # Back to low exploration
+            w_repeat  = 0.003  # 6x increase from 0.0005, strong penalty
+            w_streak  = 0.002  # 2x increase
+            w_idle    = 0.002  # 2x increase
+        
         # Cleaning reward / 清扫奖励
         self.cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
         r_clean = w_clean * float(self.cleaned_this_step)
@@ -631,12 +711,34 @@ class Preprocessor:
         # Explore: new cell reward + repeat penalty / 探索：新格子 + 回环惩罚
         r_new = w_new if self.is_new_cell else 0.0
         r_repeat = -w_repeat * float(self.loop_flag)
+        
+        # Coverage change reward / 覆盖率增量奖励
+        coverage_delta = self.coverage_ratio - self.last_coverage_ratio
+        w_coverage = 0.002
+        r_coverage = w_coverage * coverage_delta
+        self.last_coverage_ratio = self.coverage_ratio
 
-        # Charger navigation: potential-based shaping (low battery gated, battery_max independent)
-        # 回充导航：势函数差分（低电量门控，与 battery_max 无关）
-        reach_r = self.battery / max(self.bfs_d_charger, 1.0)
-        gate = float(np.clip((2.0 - reach_r) / 2.0, 0.0, 1.0))
-        # Prefer BFS path distance if available (Phase2) / 若可用优先用 BFS 路径距离
+        # Charger navigation: three-stage gating strategy / 回充：三段门控策略
+        # Low battery: aggressive charging / 低电量：激进充电
+        # Medium battery: conditional charging / 中等电量：条件充电
+        # High battery: passive charging / 高电量：被动充电
+        batt_ratio = self.battery / max(self.battery_max, 1)
+        
+        if batt_ratio < 0.30:
+            # Emergency charging: charge regardless of distance / 紧急充电：无视距离
+            gate = 1.0
+            
+        elif batt_ratio < 0.60:
+            # Active charging: charge if reachable / 主动充电：可达时充电
+            reach_r = self.battery / max(self.bfs_d_charger, 1.0)
+            gate = float(np.clip(1.0 - reach_r / 3.0, 0.3, 1.0))  # gate in [0.3, 1.0]
+            
+        else:
+            # Passive charging: original logic / 被动充电：原逻辑
+            reach_r = self.battery / max(self.bfs_d_charger, 1.0)
+            gate = float(np.clip((2.0 - reach_r) / 2.0, 0.0, 1.0))
+        
+        # Prefer BFS distance (Phase2) / 优先用BFS路径距离
         d_bfs_norm = float(np.clip(self.bfs_d_charger / 256.0, 0.0, 1.0))
         d_euc_norm = float(np.clip(self._charger_feats()[0], 0.0, 1.0))
         d_charger_norm = d_bfs_norm if d_bfs_norm < 1.0 else d_euc_norm
@@ -677,7 +779,7 @@ class Preprocessor:
         # Wall collision penalty: wasted step + battery / 撞墙惩罚：浪费步数+电量
         wall_penalty = -0.02 * self.wall_hit
 
-        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_escape + step_penalty + wall_penalty)
+        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_coverage + r_escape + step_penalty + wall_penalty)
 
         self.last_reward_components = {
             "cleaning": float(r_clean),
@@ -687,6 +789,7 @@ class Preprocessor:
             "explore_repeat": float(r_repeat),
             "eff_streak": float(r_streak),
             "eff_idle": float(r_idle),
+            "coverage_gain": float(r_coverage),
             "escape": float(r_escape),
             "step_penalty": float(step_penalty),
             "wall_penalty": float(wall_penalty),
