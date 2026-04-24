@@ -77,6 +77,10 @@ class Algorithm:
         self.optimizer.step()
         self.train_step += 1
 
+        # Entropy coefficient decay / 熵系数衰减
+        decay_frac = min(1.0, self.train_step / max(Config.BETA_DECAY_STEPS, 1))
+        self.var_beta = Config.BETA_START + (Config.BETA_END - Config.BETA_START) * decay_frac
+
         results = {"total_loss": total_loss.item()}
 
         # Periodic monitoring report

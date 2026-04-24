@@ -19,11 +19,11 @@ class Config:
         3 * 7 * 7, # local view: tri-channel avg pool (obstacle/cleaned/dirt) 21×21→7×7×3=147
         12,        # global state
         8,         # legal action
-        4,         # charger feats
+        7,         # charger feats (nearest: dist+dx+dz, target: dist+dx+dz, urgency)
         4,         # npc feats
         19,        # traj feats (K=2 => 16 + dx/dz + loop)
         5,         # memory feats (原3 → 5)
-        4,         # bfs feats (charger_dist + dirt_dist + reach_ratio + urgency)
+        6,         # bfs feats (charger_dist + dirt_dist + dirt_dx + dirt_dz + reach_ratio + urgency)
     ]
     FEATURE_SPLIT_SHAPE = FEATURES
     FEATURE_LEN = sum(FEATURES)
@@ -43,7 +43,9 @@ class Config:
     LAMDA = 0.95
 
     INIT_LEARNING_RATE_START = 0.0003
-    BETA_START = 0.001
+    BETA_START = 0.005          # entropy coef start (moderate exploration) / 熵系数起始值（适度探索）
+    BETA_END = 0.001            # entropy coef end (low for late convergence) / 熵系数终值（收敛）
+    BETA_DECAY_STEPS = 50000    # steps to decay from BETA_START to BETA_END / 衰减步数
     CLIP_PARAM = 0.2
     VF_COEF = 0.5
 

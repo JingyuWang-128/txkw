@@ -153,24 +153,20 @@ class EpisodeRunner:
                     total_score = env_obs["observation"]["env_info"]["total_score"]
 
                     if truncated:
-                        # Survived to max steps: higher cleaning ratio → more reward
-                        # 存活到最大步数：清扫比例越高奖励越多
+                        # Survived to max steps: strong reward for survival + cleaning
+                        # 存活到最大步数：存活本身有价值 + 清扫比例加成
                         cleaning_ratio = fm.dirt_cleaned / max(fm.total_dirt, 1)
-                        final_reward = 5.0 + 5.0 * cleaning_ratio
+                        final_reward = 5.0 + 10.0 * cleaning_ratio
                         result_str = "WIN"
                     else:
-                        # Early termination (battery depleted or collision): distinguish penalty
-                        # 提前结束（电量耗尽或碰撞）：区分惩罚
+                        # Early death = bad, regardless of cause
+                        # 提前死亡 = 不好，无论原因
                         if ep_min_npc_dist < 0.5:
-                            # NPC collision: severe penalty
-                            # NPC碰撞：严重惩罚
-                            final_reward = -10.0
+                            final_reward = -5.0
                             result_str = "NPC_COLLISION"
                         else:
-                            # Battery depleted or other early termination
-                            # 电量耗尽或其他提前结束
-                            final_reward = -2.0
-                            result_str = "FAIL"
+                            final_reward = -5.0
+                            result_str = "BATTERY_DEAD"
 
                     comp_str = " ".join(
                         [f"{k}:{ep_reward_comps.get(k, 0.0):.3f}" for k in sorted(ep_reward_comps.keys())]
