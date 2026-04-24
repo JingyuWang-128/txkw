@@ -78,7 +78,7 @@ class Preprocessor:
         self.visited_coarse = set()  # visited coarse bins
         self.recent_positions = []  # sliding window of recent positions
 
-        self.action_hist_k = 2
+        self.action_hist_k = 1
         self.action_hist = [-1] * self.action_hist_k
 
         self.steps_since_clean = 0  # steps since last successful clean / 距上次清扫步数
@@ -89,6 +89,7 @@ class Preprocessor:
 
         self.last_d_charger_norm = 1.0
         self.last_reward_components = {}
+        self.last_coverage_ratio = 0.0  # Track coverage change for reward
 
         # cached step metrics
         self.d_charger = 200.0
@@ -232,10 +233,24 @@ class Preprocessor:
         uniq_recent = len(set(self.recent_positions))
         self.recent_coverage = float(uniq_recent / max(1, len(self.recent_positions)))
 
-        # loop flag (returned to a recent position)
-        recent_window = 20
-        recent = self.recent_positions[-recent_window:]
-        self.loop_flag = 1.0 if len(recent) >= 2 and recent.count((hx, hz)) >= 2 else 0.0
+        # loop flag: multi-dimensional loop detection / 回环标志：多维度回环检测
+        # 1. Exact repeat: visited same cell in recent 20 steps / 精确回环：20步内重复访问同一格子
+        recent_window_short = 20
+        recent_short = self.recent_positions[-recent_window_short:] if len(self.recent_positions) >= recent_window_short else self.recent_positions
+        loop_exact = 1.0 if len(recent_short) >= 2 and recent_short.count((hx, hz)) >= 2 else 0.0
+        
+        # 2. Zigzag pattern: high repetition rate in 50-step window / 之字形走位：50步内高重复率
+        recent_window_long = 50
+        recent_long = self.recent_positions[-recent_window_long:] if len(self.recent_positions) >= recent_window_long else self.recent_positions
+        if len(recent_long) > 10:
+            unique_count = len(set(recent_long))
+            repetition_ratio = 1.0 - (unique_count / len(recent_long))
+            loop_zigzag = 1.0 if repetition_ratio > 0.7 else 0.0
+        else:
+            loop_zigzag = 0.0
+        
+        # Take maximum of both detections / 取两个检测的最大值
+        self.loop_flag = max(loop_exact, loop_zigzag)
 
         # charge count heuristic: battery increased (e.g., charging)
         self.just_charged = self.battery > self.last_battery + 5
@@ -272,18 +287,44 @@ class Preprocessor:
         if self.step_no <= 1 or self.step_no % 5 == 0 or just_charged:
             self.bfs_d_target_charger, self.bfs_target_charger_dir = self._calc_bfs_to_target_charger()
 
-        # Trapped detection: track if agent is moving in small circle / 被困检测：检测是否在小范围转圈
+        # Enhanced trapped detection: multi-dimensional / 增强被嚰検测：多维度判断
         pos_dist = float(np.sqrt((hx - self.last_escape_pos[0])**2 + (hz - self.last_escape_pos[1])**2))
-        if pos_dist < 3.0:
+        
+        # 1. Position change detection / 位置変化检测
+        position_change_low = pos_dist < 3.0
+        
+        # 2. Efficiency detection: steps vs new cells / 效率检测：步數 vs 新格子
+        efficiency_low = False
+        if self.step_no > 50:
+            steps_per_new = self.step_no / max(len(self.visited), 1)
+            efficiency_low = steps_per_new > 60  # 60 steps for only 1 new cell
+        
+        # 3. Movement speed detection / 速度检测：平均移动距离
+        speed_low = False
+        if len(self.recent_positions) > 20:
+            recent_path = self.recent_positions[-20:]
+            total_dist = sum([
+                np.sqrt((recent_path[i][0]-recent_path[i-1][0])**2 + 
+                       (recent_path[i][1]-recent_path[i-1][1])**2)
+                for i in range(1, len(recent_path))
+            ])
+            avg_speed = total_dist / len(recent_path)
+            speed_low = avg_speed < 1.5
+        
+        # Update stuck counter based on multi-dimensional detection / 根据多维度检测更新被嚰计数
+        if position_change_low or speed_low:
             self.stuck_counter += 1
         else:
             self.stuck_counter = 0
             self.last_escape_pos = (hx, hz)
-
-        # Enter escape mode if stuck for many consecutive steps / 连续多步被困则进入突围模式
-        if self.stuck_counter >= 15:
+        
+        # Enter escape mode: multiple conditions / 进入突囲模式：多条件
+        should_escape = (self.stuck_counter >= 15 or efficiency_low)
+        if should_escape and not self.escape_mode:
             self.escape_mode = True
-        # Exit escape mode once agent moved significantly / 移动超过一定距离则退出突围模式
+            self.last_escape_pos = (hx, hz)
+        
+        # Exit escape mode / 退出突囲模式
         if self.escape_mode and pos_dist >= 10.0:
             self.escape_mode = False
             self.stuck_counter = 0
@@ -384,7 +425,7 @@ class Preprocessor:
         使用较大的 max_expand 确保充电桩距离精确（关系生死）。
         """
         if not self.chargers:
-            return 256.0, (0, 0)
+            return 256.0
         # organs size w=h=3, treat as 3x3 area around center / 充电桩占 3x3
         targets = set()
         for (x, z) in self.chargers:
@@ -393,23 +434,7 @@ class Preprocessor:
                     tx, tz = int(x + dx), int(z + dz)
                     if 0 <= tx < self.GRID_SIZE and 0 <= tz < self.GRID_SIZE:
                         targets.add((tx, tz))
-        return self._bfs_distance_and_dir(self.cur_pos, targets, max_expand=8192)
-
-    def _calc_bfs_to_target_charger(self):
-        """BFS to the target charger (patrol destination), returns (distance, direction).
-
-        BFS到目标充电桩（巡回目的地），返回（距离，首步方向）。
-        """
-        if self.target_charger_pos is None:
-            return 256.0, (0, 0)
-        tx, tz = self.target_charger_pos
-        targets = set()
-        for dx in (-1, 0, 1):
-            for dz in (-1, 0, 1):
-                nx, nz = int(tx + dx), int(tz + dz)
-                if 0 <= nx < self.GRID_SIZE and 0 <= nz < self.GRID_SIZE:
-                    targets.add((nx, nz))
-        return self._bfs_distance_and_dir(self.cur_pos, targets, max_expand=2048)
+        return self._bfs_distance(self.cur_pos, targets)
 
     def _calc_bfs_to_local_dirt(self):
         """BFS to nearest dirt, returns (distance, (first_step_dx, first_step_dz)).
@@ -451,28 +476,24 @@ class Preprocessor:
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
-        """Local view feature (147D): tri-channel 3×3 avg pool on 21×21 view.
+        """Local view feature (98D): dual-channel 3×3 avg pool on 21×21 view.
 
-        局部视野特征（147D）：21×21视野按三通道分别做3×3平均池化，输出7×7×3=147D。
-        通道顺序: [0]障碍率 [1]已清扫率 [2]污渍率。
-
-        相比单通道max pool的优势：
-          - 能区分"1格污渍+8格障碍"和"1格污渍+8格已清扫"（max pool将两者输出相同）
-          - 障碍率高的块伴随污渍低水平，模型可学会"未必能达，不要去"
+        局部视野特征（98D）：21×21视野按双通道做3×3平均池化，输出7×7×2=98D。
+        通道: [0]障碍率 [1]污渍率。
+        已清扫率 = 1 - 障碍率 - 污渍率，线性冗余故省略。
         """
         view = self._view_map  # values: 0=obstacle, 1=cleaned, 2=dirt
         h, w = view.shape
         ph, pw = h // 3, w // 3
         blocks = view[:ph*3, :pw*3].reshape(ph, 3, pw, 3)  # (7, 3, 7, 3)
         obstacle = (blocks == 0).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
-        cleaned  = (blocks == 1).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
         dirt     = (blocks == 2).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
-        return np.concatenate([obstacle.flatten(), cleaned.flatten(), dirt.flatten()])  # 147D
+        return np.concatenate([obstacle.flatten(), dirt.flatten()])  # 98D
 
     def _get_global_state_feature(self):
-        """Global state feature (12D).
+        """Global state feature (6D).
 
-        全局状态特征（12D）。
+        全局状态特征（6D）。
 
         Dimensions / 维度说明：
           [0]  step_norm         step progress / 步数归一化 [0,1]
@@ -481,12 +502,6 @@ class Preprocessor:
           [3]  wall_hit          wall collision last step / 上步是否撞墙 {0,1}
           [4]  pos_x_norm        x position / x 坐标归一化 [0,1]
           [5]  pos_z_norm        z position / z 坐标归一化 [0,1]
-          [6]  ray_N_dirt        north ray distance / 向上（z-）方向最近污渍距离
-          [7]  ray_E_dirt        east ray distance / 向右（x+）方向
-          [8]  ray_S_dirt        south ray distance / 向下（z+）方向
-          [9]  ray_W_dirt        west ray distance / 向左（x-）方向
-          [10] nearest_dirt_norm nearest dirt Euclidean distance / 最近污渍欧氏距离归一化
-          [11] dirt_delta        approaching dirt indicator / 是否在接近污渍（1=是, 0=否）
         """
         step_norm = _norm(self.step_no, 2000)
         battery_ratio = _norm(self.battery, self.battery_max)
@@ -496,42 +511,6 @@ class Preprocessor:
         pos_x_norm = _norm(hx, self.GRID_SIZE)
         pos_z_norm = _norm(hz, self.GRID_SIZE)
 
-        # 4-directional ray to find nearest dirt
-        # 四方向射线找最近污渍距离
-        ray_dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # N E S W
-        ray_dirt = []
-        max_ray = 30
-        for dx, dz in ray_dirs:
-            x, z = hx, hz
-            found = max_ray
-            for step in range(1, max_ray + 1):
-                x += dx
-                z += dz
-                if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
-                    break
-                if self._view_map is not None:
-                    cell = (
-                        int(
-                            self._view_map[
-                                np.clip(x - (hx - self.VIEW_HALF), 0, 20), np.clip(z - (hz - self.VIEW_HALF), 0, 20)
-                            ]
-                        )
-                        if (0 <= x - hx + self.VIEW_HALF < 21 and 0 <= z - hz + self.VIEW_HALF < 21)
-                        else 0
-                    )
-                    if cell == 2:
-                        found = step
-                        break
-            ray_dirt.append(_norm(found, max_ray))
-
-        # Nearest dirt Euclidean distance (estimated from full 21×21 view)
-        # 最近污渍欧氏距离（完整21×21视野内估算）
-        self.last_nearest_dirt_dist = self.nearest_dirt_dist
-        self.nearest_dirt_dist = self._calc_nearest_dirt_dist()
-        nearest_dirt_norm = _norm(self.nearest_dirt_dist, 180)
-
-        dirt_delta = 1.0 if self.nearest_dirt_dist < self.last_nearest_dirt_dist else 0.0
-
         return np.array(
             [
                 step_norm,
@@ -540,12 +519,6 @@ class Preprocessor:
                 float(self.wall_hit),
                 pos_x_norm,
                 pos_z_norm,
-                ray_dirt[0],
-                ray_dirt[1],
-                ray_dirt[2],
-                ray_dirt[3],
-                nearest_dirt_norm,
-                dirt_delta,
             ],
             dtype=np.float32,
         )
@@ -730,21 +703,21 @@ class Preprocessor:
         return np.array([d_ch / max_bfs, d_di / max_bfs, dirt_dx, dirt_dz, reach_ratio, urgency], dtype=np.float32)
 
     def feature_process(self, env_obs, last_action):
-        """Generate 208D feature vector, legal action mask, and scalar reward.
+        """Generate 203D feature vector, legal action mask, and scalar reward.
 
-        生成 208D 特征向量（147D视野 + 12D全局 + 8D合法动作 + 7D充电桩 + 4D NPC + 19D轨迹 + 5D记忆 + 6D BFS）、合法动作掩码和标量奖励。
+        生成 203D 特征向量（147D视野 + 12D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 19D轨迹 + 5D记忆 + 4D BFS）、合法动作掩码和标量奖励。
         """
         self.pb2struct(env_obs, last_action)
 
-        local_view = self._get_local_view_feature()  # 147D (obstacle+cleaned+dirt each 7x7)
-        global_state = self._get_global_state_feature()  # 12D
+        local_view = self._get_local_view_feature()  # 98D (obstacle+dirt each 7x7)
+        global_state = self._get_global_state_feature()  # 6D
         legal_action = self.get_legal_action()  # 8D
         legal_arr = np.array(legal_action, dtype=np.float32)
 
         # Phase1/2 extra features / 新增特征
         charger_feats = self._charger_feats()  # 7D (nearest+target+urgency)
         npc_feats = self._npc_feats()  # 4D
-        traj_feats = self._traj_feats()  # 19D (K=2 => 16 + 3)
+        traj_feats = self._traj_feats()  # 11D (K=1 => 8 + 3)
         memory_feats = self._memory_feats()  # 5D
         bfs_feats = self._bfs_feats()  # 6D (dist+dir+reach+urgency)
 
@@ -757,17 +730,16 @@ class Preprocessor:
         return feature, legal_action, reward
 
     def reward_process(self):
-        # ======================================================================
-        # Reward design: dominant cleaning + meaningful navigation + sparse penalties.
-        # 奖励设计：压倒性清扫信号 + 有意义的导航信号 + 稀疏惩罚。
-        #
-        # Key fix: use RAW BFS distance delta (~±1/step) not normalized (~±0.004/step).
-        # 关键修复：用原始BFS距离增量（每步±1），不用归一化增量（每步±0.004）。
-        # This makes navigational rewards 250x stronger than the old potential shaping.
-        # 这让导航奖励比旧的势函数强250倍。
-        # ======================================================================
+        # Weights (清扫优先模式) / 权重（清扫为主要目标，充电低电量门控）
+        w_clean = 0.10       # 清扫奖励：恢复为主要目标（原0.03）
+        w_charge = 0.08      # 充电奖励：低电量门控激活（原0.05始终激活）
+        w_npc = 0.03         # NPC躲避：保持不变
+        w_new = 0.002        # 探索新格子：适当提升（原0.0005）
+        w_repeat = 0.0005    # 回环惩罚：适当提升（原0.0002）
+        w_streak = 0.001     # 连清奖励：适当提升（原0.0005）
+        w_idle = 0.001       # 空跑惩罚：适当提升（原0.0005）
 
-        # 1. Cleaning reward — dominant signal / 清扫奖励——主信号
+        # Cleaning reward / 清扫奖励
         self.cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
         if self.cleaned_this_step > 0:
             self.clean_streak += 1
@@ -775,84 +747,74 @@ class Preprocessor:
         else:
             self.clean_streak = 0
             self.idle_steps += 1
-        r_clean = 0.20 * float(self.cleaned_this_step)
 
-        # 2. Navigation guidance — two modes / 导航引导——双模式
-        # Mode A: dirt visible → seek nearest dirt / 脏格可见→寻脏
-        # Mode B: no dirt visible → patrol toward target charger / 无脏格→巡回充电桩
-        # This prevents aimless wandering and wall-following when local area is clean.
-        # 这防止了附近已清扫干净后的无目的游走和沿墙走。
-        cur_d_dirt = self.bfs_d_dirt
-        prev_d_dirt = self._prev_bfs_d_dirt
-        self._prev_bfs_d_dirt = cur_d_dirt
-        r_dirt_seek = 0.0
-        if cur_d_dirt < 200.0 and prev_d_dirt < 200.0 and self.cleaned_this_step == 0:
-            # Mode A: dirt visible, guide toward it / 模式A：视野内有脏格，向脏格移动
-            delta_dirt = float(prev_d_dirt - cur_d_dirt)
-            r_dirt_seek = 0.02 * float(np.clip(delta_dirt, -3.0, 3.0))
-        elif cur_d_dirt >= 200.0 and self.cleaned_this_step == 0:
-            # Mode B: no dirt visible, patrol toward target charger to discover new areas
-            # 模式B：无可见脏格，向目标充电桩巡回以发现新区域
-            d_target = self.bfs_d_target_charger
-            if hasattr(self, '_prev_bfs_d_target') and d_target < 200.0 and self._prev_bfs_d_target < 200.0:
-                delta_patrol = float(self._prev_bfs_d_target - d_target)
-                r_dirt_seek = 0.015 * float(np.clip(delta_patrol, -3.0, 3.0))
-            self._prev_bfs_d_target = d_target
+        streak_cap = 20
+        r_streak = w_streak * float(min(self.clean_streak, streak_cap))
+        r_idle = -w_idle if self.cleaned_this_step == 0 else 0.0
 
-        # 3. Charging reward — urgency-scaled / 充电奖励——紧迫度缩放
-        # Key insight: charging reward MUST exceed r_clean(0.20) when battery is critical,
-        # otherwise agent always prefers cleaning over charging → dies.
-        # 关键洞察：充电奖励必须在电量危急时超过r_clean(0.20)，否则智能体永远优先扫地→没电死。
-        cur_d_ch = self.bfs_d_charger
-        prev_d_ch = self._prev_bfs_d_charger
-        self._prev_bfs_d_charger = cur_d_ch
+        # Explore: new cell reward + repeat penalty / 探索：新格子 + 回环惩罚
+        r_new = w_new if self.is_new_cell else 0.0
+        r_repeat = -w_repeat * float(self.loop_flag)
 
-        # 3a. Charge bonus: big reward for actually charging / 充电成功大奖
-        r_charge_bonus = 1.0 if self.just_charged else 0.0
+        # Charger navigation: potential-based shaping (low battery gated, battery_max independent)
+        # 回充导航：势函数差分（低电量门控，与 battery_max 无关）
+        reach_r = self.battery / max(self.bfs_d_charger, 1.0)
+        gate = float(np.clip((2.0 - reach_r) / 2.0, 0.0, 1.0))
+        # Prefer BFS path distance if available (Phase2) / 若可用优先用 BFS 路径距离
+        d_bfs_norm = float(np.clip(self.bfs_d_charger / 256.0, 0.0, 1.0))
+        d_euc_norm = float(np.clip(self._charger_feats()[0], 0.0, 1.0))
+        d_charger_norm = d_bfs_norm if d_bfs_norm < 1.0 else d_euc_norm
+        phi = -d_charger_norm
+        last_phi = -float(np.clip(self.last_d_charger_norm, 0.0, 1.0))
+        r_charge = w_charge * gate * (phi - last_phi)
+        self.last_d_charger_norm = d_charger_norm
 
-        # 3b+3c. Urgency-scaled charging incentives / 紧迫度缩放充电激励
-        # urgency: 0=safe(电量充足), 1=critical(刚好够到充电桩)
-        # safe_battery = distance × 3.5 (余量含绕路)
-        r_charge_seek = 0.0
-        r_battery_danger = 0.0
-        if cur_d_ch < 200.0:
-            safe_battery = cur_d_ch * 3.5
-            if self.battery < safe_battery:
-                urgency = 1.0 - (self.battery / max(safe_battery, 1.0))
-                urgency = float(np.clip(urgency, 0.0, 1.0))
+        # Step penalty (分段) / 步数惩罚（分段）
+        # 前期正激励鼓励多走，中期中性，后期负惩罚
+        step = getattr(self, 'step_no', 0)
+        if step < 300:
+            step_penalty = 0.001
+        elif step < 700:
+            step_penalty = 0.0
+        else:
+            step_penalty = -0.001
 
-                # 3b. Directional: weight scales 0.05→0.25 with urgency
-                # 方向引导：权重随紧迫度从0.05升到0.25
-                # At urgency>0.35, charge_seek(0.12+) > r_clean(0.20) after netting penalties
-                # 紧迫度>0.35时，充电奖励净值超过清扫奖励
-                if prev_d_ch < 200.0:
-                    delta_ch = float(prev_d_ch - cur_d_ch)
-                    weight = 0.05 + 0.20 * urgency
-                    r_charge_seek = weight * float(np.clip(delta_ch, -3.0, 3.0))
-
-                # 3c. Per-step pressure: 0→-0.10 with urgency (creates VALUE gradient)
-                # 每步压力：随紧迫度从0到-0.10（在价值函数中形成梯度）
-                r_battery_danger = -0.10 * urgency
-
-        # 4. NPC proximity penalty — sparse / NPC近距离惩罚——稀疏
+        # NPC avoid: soft penalty inside safe radius / NPC 躲避：安全半径内软惩罚
+        safe_radius = 4.0
         d_npc = float(self.d_npc_min)
-        r_npc = -0.10 if d_npc < 2.0 else 0.0
+        s = max(0.0, (safe_radius - d_npc) / safe_radius)
+        r_npc = -w_npc * (s * s)
 
-        # 5. Wall collision — sparse / 撞墙——稀疏
-        r_wall = -0.01 * self.wall_hit
+        # Extra severe penalty when extremely close to NPC / 极近距离额外惩罚
+        if d_npc < 1.0:
+            r_npc = min(r_npc, -0.5)
 
-        total = float(r_clean + r_dirt_seek
-                      + r_charge_bonus + r_charge_seek + r_battery_danger
-                      + r_npc + r_wall)
+        # Escape mode: reduce NPC penalty and add escape reward / 突围模式：降低NPC惩罚并添加突围奖励
+        r_escape = 0.0
+        if self.escape_mode:
+            # In escape mode, allow crossing NPC to get out / 突围模式下允许穿越NPC
+            r_npc = r_npc * 0.3
+            # Reward for moving away from stuck position / 奖励远离被困位置
+            pos_dist = float(np.sqrt((self.cur_pos[0] - self.last_escape_pos[0])**2 + (self.cur_pos[1] - self.last_escape_pos[1])**2))
+            r_escape = 0.01 * min(pos_dist / 10.0, 1.0)  # reward proportional to escape progress
+
+        # Wall collision penalty: wasted step + battery / 撞墙惩罚：浪费步数+电量
+        wall_penalty = -0.02 * self.wall_hit
+
+        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_escape + step_penalty + wall_penalty)
 
         self.last_reward_components = {
-            "clean": float(r_clean),
-            "dirt_seek": float(r_dirt_seek),
-            "charge_bonus": float(r_charge_bonus),
-            "charge_seek": float(r_charge_seek),
-            "batt_danger": float(r_battery_danger),
-            "npc": float(r_npc),
-            "wall": float(r_wall),
+            "cleaning": float(r_clean),
+            "charge_nav": float(r_charge),
+            "npc_avoid": float(r_npc),
+            "explore_new": float(r_new),
+            "explore_repeat": float(r_repeat),
+            "eff_streak": float(r_streak),
+            "eff_idle": float(r_idle),
+            "escape": float(r_escape),
+            "step_penalty": float(step_penalty),
+            "wall_penalty": float(wall_penalty),
+            "d_charger_norm": float(d_charger_norm),
             "total": total,
         }
 

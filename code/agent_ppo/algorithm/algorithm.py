@@ -34,6 +34,12 @@ class Algorithm:
         self.vf_coef = Config.VF_COEF
         self.var_beta = Config.BETA_START
         self.label_size = Config.ACTION_NUM
+        
+        # Learning rate schedule parameters / 学习率计划参数
+        self.init_lr = 3e-4
+        self.final_lr = 1e-4
+        self.lr_warmup_steps = 50000
+        self.lr_decay_end_steps = 150000
 
         self.train_step = 0
         self.last_report_time = 0
@@ -76,6 +82,14 @@ class Algorithm:
 
         self.optimizer.step()
         self.train_step += 1
+        
+        # Update learning rate schedule / 更新学习率计划
+        new_lr = self._compute_learning_rate(self.train_step)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
+        
+        # Update entropy bonus schedule / 更新熵奖励计划
+        self.var_beta = self._compute_entropy_beta(self.train_step)
 
         # Entropy coefficient decay / 熵系数衰减
         decay_frac = min(1.0, self.train_step / max(Config.BETA_DECAY_STEPS, 1))
