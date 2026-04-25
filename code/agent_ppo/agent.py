@@ -55,9 +55,9 @@ class Agent(BaseAgent):
         self.last_reward = 0.0
 
     def observation_process(self, env_obs):
-        """Convert raw env_obs to ObsData (208D feature + legal action mask).
+        """Convert raw env_obs to ObsData (148D feature + legal action mask).
 
-        将原始 env_obs 转换为 ObsData（208D 特征 + 合法动作掩码）。
+        将原始 env_obs 转换为 ObsData（148D 特征 + 合法动作掩码）。
         """
         feature, legal_action, reward = self.preprocessor.feature_process(env_obs, self.last_action)
         self.last_reward = reward

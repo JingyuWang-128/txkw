@@ -17,12 +17,12 @@ class Config:
     # 特征维度
     FEATURES = [
         2 * 7 * 7, # local view: dual-channel avg pool (obstacle/dirt) 21×21→7×7×2=98
-        6,         # global state
+        9,         # global state (6 base + battery_max + n_chargers + n_npcs)
         8,         # legal action
         7,         # charger feats (nearest: dist+dx+dz, target: dist+dx+dz, urgency)
         4,         # npc feats
         11,        # traj feats (K=1 => 8 + dx/dz + loop)
-        5,         # memory feats (原3 → 5)
+        5,         # memory feats
         6,         # bfs feats (charger_dist + dirt_dist + dirt_dx + dirt_dz + reach_ratio + urgency)
     ]
     FEATURE_SPLIT_SHAPE = FEATURES

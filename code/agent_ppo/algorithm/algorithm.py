@@ -91,10 +91,6 @@ class Algorithm:
         # Update entropy bonus schedule / 更新熵奖励计划
         self.var_beta = self._compute_entropy_beta(self.train_step)
 
-        # Entropy coefficient decay / 熵系数衰减
-        decay_frac = min(1.0, self.train_step / max(Config.BETA_DECAY_STEPS, 1))
-        self.var_beta = Config.BETA_START + (Config.BETA_END - Config.BETA_START) * decay_frac
-
         results = {"total_loss": total_loss.item()}
 
         # Periodic monitoring report
@@ -177,3 +173,24 @@ class Algorithm:
         logits = logits * legal_action
         logits = logits + 1e5 * (legal_action - 1)
         return torch.nn.functional.softmax(logits, dim=1)
+
+    def _compute_learning_rate(self, step):
+        """Warmup + linear decay learning rate schedule.
+
+        预热 + 线性衰减学习率计划。
+        """
+        if step < self.lr_warmup_steps:
+            return self.init_lr * step / max(self.lr_warmup_steps, 1)
+        elif step < self.lr_decay_end_steps:
+            frac = (step - self.lr_warmup_steps) / max(self.lr_decay_end_steps - self.lr_warmup_steps, 1)
+            return self.init_lr + (self.final_lr - self.init_lr) * frac
+        else:
+            return self.final_lr
+
+    def _compute_entropy_beta(self, step):
+        """Linear decay entropy coefficient.
+
+        线性衰减熵系数。
+        """
+        decay_frac = min(1.0, step / max(Config.BETA_DECAY_STEPS, 1))
+        return Config.BETA_START + (Config.BETA_END - Config.BETA_START) * decay_frac

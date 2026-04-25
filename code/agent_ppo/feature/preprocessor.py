@@ -67,9 +67,15 @@ class Preprocessor:
         self._legal_act = [1] * 8
 
         # -------- Phase1: entity parsing & history state --------
-        self.chargers = []  # list[(x,z)]
+        self.chargers = []  # list[(x,z)] — current frame chargers
+        self.all_known_chargers = set()  # persistent memory of ALL charger positions ever seen
         self.npcs = []  # list[(x,z)]
         self.step_cleaned_cells = []  # list[(x,z)]
+
+        # Stable environment config counts (from env_info, not fluctuating view)
+        # 稳定的环境配置计数（来自 env_info，不受视野波动影响）
+        self.config_charger_count = 4  # updated from env_info["total_charger"]
+        self.config_npc_count = 4      # updated from first-frame NPC list length
 
         self.last_pos = (0, 0)
         self.last_battery = self.battery
@@ -151,6 +157,11 @@ class Preprocessor:
         self.dirt_cleaned = int(hero["dirt_cleaned"])
         self.total_dirt = max(int(env_info["total_dirt"]), 1)
 
+        # Stable config counts from env_info (frame-independent)
+        # 从 env_info 获取稳定的配置计数（帧无关）
+        if "total_charger" in env_info:
+            self.config_charger_count = int(env_info["total_charger"])
+
         # Update idle sliding window for _memory_feats / 更新idle滑动窗口
         _step_cleaned = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
         self.idle_window.append(0 if _step_cleaned > 0 else 1)
@@ -197,6 +208,12 @@ class Preprocessor:
                     self.chargers.append((int(p.get("x", 0)) + 1, int(p.get("z", 0)) + 1))
                 except Exception:
                     continue
+        # Persist all charger positions ever seen (防止帧数据不全时丢失充电桩)
+        for c in self.chargers:
+            self.all_known_chargers.add(c)
+        # Use comprehensive list for all downstream logic
+        # 用完整列表供后续BFS、特征、巡回使用
+        self.chargers = list(self.all_known_chargers)
 
         self.npcs = []
         npcs = frame_state.get("npcs") if isinstance(frame_state, dict) else None
@@ -207,6 +224,10 @@ class Preprocessor:
                     self.npcs.append((int(p.get("x", 0)), int(p.get("z", 0))))
                 except Exception:
                     continue
+        # Capture NPC count from first frame (all NPCs present at start)
+        # 首帧记录NPC数量（开局所有NPC都存在）
+        if self.step_no <= 1 and len(self.npcs) > 0:
+            self.config_npc_count = len(self.npcs)
 
         # Wall collision: agent tried to move but stayed in place / 撞墙检测
         self.wall_hit = 1.0 if self.step_no > 0 and self.cur_pos == self.last_pos else 0.0
@@ -425,7 +446,7 @@ class Preprocessor:
         使用较大的 max_expand 确保充电桩距离精确（关系生死）。
         """
         if not self.chargers:
-            return 256.0
+            return 256.0, (0, 0)
         # organs size w=h=3, treat as 3x3 area around center / 充电桩占 3x3
         targets = set()
         for (x, z) in self.chargers:
@@ -434,7 +455,23 @@ class Preprocessor:
                     tx, tz = int(x + dx), int(z + dz)
                     if 0 <= tx < self.GRID_SIZE and 0 <= tz < self.GRID_SIZE:
                         targets.add((tx, tz))
-        return self._bfs_distance(self.cur_pos, targets)
+        return self._bfs_distance_and_dir(self.cur_pos, targets, max_expand=8192)
+
+    def _calc_bfs_to_target_charger(self):
+        """BFS to the target charger (patrol destination), returns (distance, direction).
+
+        BFS到目标充电桩（巡回目的地），返回（距离，首步方向）。
+        """
+        if self.target_charger_pos is None:
+            return 256.0, (0, 0)
+        tx, tz = self.target_charger_pos
+        targets = set()
+        for dx in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                nx, nz = int(tx + dx), int(tz + dz)
+                if 0 <= nx < self.GRID_SIZE and 0 <= nz < self.GRID_SIZE:
+                    targets.add((nx, nz))
+        return self._bfs_distance_and_dir(self.cur_pos, targets, max_expand=2048)
 
     def _calc_bfs_to_local_dirt(self):
         """BFS to nearest dirt, returns (distance, (first_step_dx, first_step_dz)).
@@ -491,9 +528,9 @@ class Preprocessor:
         return np.concatenate([obstacle.flatten(), dirt.flatten()])  # 98D
 
     def _get_global_state_feature(self):
-        """Global state feature (6D).
+        """Global state feature (9D).
 
-        全局状态特征（6D）。
+        全局状态特征（9D）。
 
         Dimensions / 维度说明：
           [0]  step_norm         step progress / 步数归一化 [0,1]
@@ -502,6 +539,9 @@ class Preprocessor:
           [3]  wall_hit          wall collision last step / 上步是否撞墙 {0,1}
           [4]  pos_x_norm        x position / x 坐标归一化 [0,1]
           [5]  pos_z_norm        z position / z 坐标归一化 [0,1]
+          [6]  battery_max_norm  total capacity context / 电池总容量上下文 [0,1]
+          [7]  n_chargers_norm   charger count context / 充电桩数量上下文 [0,1]
+          [8]  n_npcs_norm       NPC count context / NPC数量上下文 [0,1]
         """
         step_norm = _norm(self.step_no, 2000)
         battery_ratio = _norm(self.battery, self.battery_max)
@@ -511,6 +551,13 @@ class Preprocessor:
         pos_x_norm = _norm(hx, self.GRID_SIZE)
         pos_z_norm = _norm(hz, self.GRID_SIZE)
 
+        # Generalization context: let agent "see" the current config
+        # 泛化上下文：让智能体"看到"当前配置，以便多配置训练时学会不同策略
+        # 用配置值而非帧级可见列表长度，确保特征稳定不波动
+        battery_max_norm = float(np.clip(self.battery_max / 300.0, 0.0, 1.0))
+        n_chargers_norm = float(np.clip(self.config_charger_count / 4.0, 0.0, 1.0))
+        n_npcs_norm = float(np.clip(self.config_npc_count / 4.0, 0.0, 1.0))
+
         return np.array(
             [
                 step_norm,
@@ -519,6 +566,9 @@ class Preprocessor:
                 float(self.wall_hit),
                 pos_x_norm,
                 pos_z_norm,
+                battery_max_norm,
+                n_chargers_norm,
+                n_npcs_norm,
             ],
             dtype=np.float32,
         )
@@ -703,14 +753,14 @@ class Preprocessor:
         return np.array([d_ch / max_bfs, d_di / max_bfs, dirt_dx, dirt_dz, reach_ratio, urgency], dtype=np.float32)
 
     def feature_process(self, env_obs, last_action):
-        """Generate 203D feature vector, legal action mask, and scalar reward.
+        """Generate 148D feature vector, legal action mask, and scalar reward.
 
-        生成 203D 特征向量（147D视野 + 12D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 19D轨迹 + 5D记忆 + 4D BFS）、合法动作掩码和标量奖励。
+        生成 148D 特征向量（98D视野 + 9D全局 + 8D合法动作 + 7D充电桩 + 4D NPC + 11D轨迹 + 5D记忆 + 6D BFS）、合法动作掩码和标量奖励。
         """
         self.pb2struct(env_obs, last_action)
 
         local_view = self._get_local_view_feature()  # 98D (obstacle+dirt each 7x7)
-        global_state = self._get_global_state_feature()  # 6D
+        global_state = self._get_global_state_feature()  # 9D
         legal_action = self.get_legal_action()  # 8D
         legal_arr = np.array(legal_action, dtype=np.float32)
 
@@ -731,8 +781,8 @@ class Preprocessor:
 
     def reward_process(self):
         # Weights (清扫优先模式) / 权重（清扫为主要目标，充电低电量门控）
-        w_clean = 0.10       # 清扫奖励：恢复为主要目标（原0.03）
-        w_charge = 0.08      # 充电奖励：低电量门控激活（原0.05始终激活）
+        w_clean = 0.10       # 清扫奖励：主要目标
+        # 充电奖励：动态权重 = 0.05 + 0.20*urgency（见下方）
         w_npc = 0.03         # NPC躲避：保持不变
         w_new = 0.002        # 探索新格子：适当提升（原0.0005）
         w_repeat = 0.0005    # 回环惩罚：适当提升（原0.0002）
@@ -748,6 +798,8 @@ class Preprocessor:
             self.clean_streak = 0
             self.idle_steps += 1
 
+        r_clean = w_clean * float(self.cleaned_this_step)
+
         streak_cap = 20
         r_streak = w_streak * float(min(self.clean_streak, streak_cap))
         r_idle = -w_idle if self.cleaned_this_step == 0 else 0.0
@@ -756,28 +808,50 @@ class Preprocessor:
         r_new = w_new if self.is_new_cell else 0.0
         r_repeat = -w_repeat * float(self.loop_flag)
 
-        # Charger navigation: potential-based shaping (low battery gated, battery_max independent)
-        # 回充导航：势函数差分（低电量门控，与 battery_max 无关）
+        # Charging: urgency-scaled reward (battery_max independent)
+        # 充电：紧迫度缩放奖励（与 battery_max 无关）
         reach_r = self.battery / max(self.bfs_d_charger, 1.0)
-        gate = float(np.clip((2.0 - reach_r) / 2.0, 0.0, 1.0))
-        # Prefer BFS path distance if available (Phase2) / 若可用优先用 BFS 路径距离
-        d_bfs_norm = float(np.clip(self.bfs_d_charger / 256.0, 0.0, 1.0))
-        d_euc_norm = float(np.clip(self._charger_feats()[0], 0.0, 1.0))
-        d_charger_norm = d_bfs_norm if d_bfs_norm < 1.0 else d_euc_norm
-        phi = -d_charger_norm
-        last_phi = -float(np.clip(self.last_d_charger_norm, 0.0, 1.0))
-        r_charge = w_charge * gate * (phi - last_phi)
-        self.last_d_charger_norm = d_charger_norm
+        urgency = float(np.clip((2.0 - reach_r) / 2.0, 0.0, 1.0))
 
-        # Step penalty (分段) / 步数惩罚（分段）
-        # 前期正激励鼓励多走，中期中性，后期负惩罚
-        step = getattr(self, 'step_no', 0)
-        if step < 300:
-            step_penalty = 0.001
-        elif step < 700:
-            step_penalty = 0.0
-        else:
-            step_penalty = -0.001
+        # Component 1: Battery danger penalty (creates VALUE pressure)
+        # 低电量危险惩罚（创造价值压力，让 critic 学到"低电量=危险"）
+        # urgency=0 → 0, urgency=0.5 → -0.05/step, urgency=1.0 → -0.10/step
+        r_battery_danger = -0.10 * urgency
+
+        # Component 2: Charging approach reward using RAW BFS delta
+        # 充电接近奖励：用原始BFS距离差（每步±1），非归一化的（/256后太小）
+        # 权重随紧迫度递增：urgency=0 → 0.05, urgency=1 → 0.25（超过 r_clean=0.10）
+        if self.step_no <= 1:
+            self._prev_bfs_d_charger = self.bfs_d_charger
+        bfs_delta = self._prev_bfs_d_charger - self.bfs_d_charger  # >0 = getting closer
+        bfs_delta = float(np.clip(bfs_delta, -2.0, 2.0))  # cap to avoid spikes
+        w_charge_dynamic = 0.05 + 0.20 * urgency
+        r_charge_approach = w_charge_dynamic * bfs_delta
+        self._prev_bfs_d_charger = self.bfs_d_charger
+
+        # Component 3: Actual charging reward (battery increased this step)
+        # 实际充电奖励：踏上充电桩充电时，按电量缺失比例给奖
+        # 电量越低奖励越大，电量满后自然趋零 → 智能体不会赖着不走
+        r_charge_actual = 0.0
+        if self.just_charged:
+            battery_deficit = 1.0 - (self.last_battery / max(self.battery_max, 1))
+            r_charge_actual = 0.15 * battery_deficit
+
+        # Component 4: Near-charger low-battery proximity bonus
+        # 近桩低电量引力：离桩 ≤3步 且 电量<70% 时额外激励靠近
+        # 用绝对电量比（非reach_r），解决"近桩时urgency=0"的盲区
+        r_proximity = 0.0
+        battery_ratio_raw = self.battery / max(self.battery_max, 1)
+        if self.bfs_d_charger <= 3 and battery_ratio_raw < 0.7:
+            proximity_scale = 1.0 - self.bfs_d_charger / 4.0   # BFS=0→1.0, 1→0.75, 2→0.5, 3→0.25
+            deficit_scale = (0.7 - battery_ratio_raw) / 0.7     # 0%→1.0, 35%→0.5, 70%→0.0
+            r_proximity = 0.06 * proximity_scale * deficit_scale
+
+        r_charge = r_battery_danger + r_charge_approach + r_charge_actual + r_proximity
+
+        # Step penalty: constant small negative to encourage efficiency
+        # 步数惩罚：固定小负值鼓励高效清扫，避免分段逻辑干扰策略学习
+        step_penalty = -0.001
 
         # NPC avoid: soft penalty inside safe radius / NPC 躲避：安全半径内软惩罚
         safe_radius = 4.0
@@ -787,7 +861,7 @@ class Preprocessor:
 
         # Extra severe penalty when extremely close to NPC / 极近距离额外惩罚
         if d_npc < 1.0:
-            r_npc = min(r_npc, -0.5)
+            r_npc = min(r_npc, -0.10)
 
         # Escape mode: reduce NPC penalty and add escape reward / 突围模式：降低NPC惩罚并添加突围奖励
         r_escape = 0.0
@@ -801,11 +875,23 @@ class Preprocessor:
         # Wall collision penalty: wasted step + battery / 撞墙惩罚：浪费步数+电量
         wall_penalty = -0.02 * self.wall_hit
 
-        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_escape + step_penalty + wall_penalty)
+        # Dirt approach reward: incentivize moving toward nearest dirt
+        # 污渍接近奖励：激励移向最近污渍，减少空步
+        if self.step_no <= 1:
+            self._prev_bfs_d_dirt = self.bfs_d_dirt
+        dirt_bfs_delta = self._prev_bfs_d_dirt - self.bfs_d_dirt  # >0 = closer to dirt
+        dirt_bfs_delta = float(np.clip(dirt_bfs_delta, -2.0, 2.0))
+        r_dirt_approach = 0.03 * dirt_bfs_delta if self.cleaned_this_step == 0 else 0.0
+        self._prev_bfs_d_dirt = self.bfs_d_dirt
+
+        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_escape + step_penalty + wall_penalty + r_dirt_approach)
 
         self.last_reward_components = {
             "cleaning": float(r_clean),
-            "charge_nav": float(r_charge),
+            "bat_danger": float(r_battery_danger),
+            "charge_approach": float(r_charge_approach),
+            "charge_actual": float(r_charge_actual),
+            "proximity": float(r_proximity),
             "npc_avoid": float(r_npc),
             "explore_new": float(r_new),
             "explore_repeat": float(r_repeat),
@@ -814,7 +900,8 @@ class Preprocessor:
             "escape": float(r_escape),
             "step_penalty": float(step_penalty),
             "wall_penalty": float(wall_penalty),
-            "d_charger_norm": float(d_charger_norm),
+            "dirt_approach": float(r_dirt_approach),
+            "urgency": float(urgency),
             "total": total,
         }
 
