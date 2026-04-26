@@ -16,14 +16,14 @@ class Config:
     # Feature dimensions
     # 特征维度
     FEATURES = [
-        2 * 7 * 7, # local view: dual-channel avg pool (obstacle/dirt) 21×21→7×7×2=98
-        6,         # global state
-        8,         # legal action
-        4,         # charger feats
-        4,         # npc feats
-        11,        # traj feats (K=1 => 8 + dx/dz + loop)
-        5,         # memory feats (原3 → 5)
-        4,         # bfs feats (charger_dist + dirt_dist + reach_ratio + urgency)
+        2 * 21 * 21, # local view: direct dual-channel 21×21 view (obstacle/dirt) = 882
+        6,          # global state
+        8,          # legal action
+        4,          # charger feats
+        4,          # npc feats
+        11,         # traj feats (K=1 => 8 + dx/dz + loop)
+        5,          # memory feats (原3 → 5)
+        4,          # bfs feats (charger_dist + dirt_dist + reach_ratio + urgency)
     ]
     FEATURE_SPLIT_SHAPE = FEATURES
     FEATURE_LEN = sum(FEATURES)

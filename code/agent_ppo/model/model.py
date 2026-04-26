@@ -38,14 +38,16 @@ class Model(nn.Module):
         self.model_name = "robot_vacuum"
         self.device = device
 
-        obs_dim = Config.DIM_OF_OBSERVATION  # 140
+        obs_dim = Config.DIM_OF_OBSERVATION  # 924
         act_num = Config.ACTION_NUM  # 8
 
         # Expanded backbone for improved representation capacity / 扩大的骨干网络以提升表示能力
-        # Original: 140 -> 192 -> 96
-        # Expanded: 140 -> 256 -> 128 -> 64 (47K params -> 65K params)
+        # Original: 924 -> 256 -> 128 -> 64
+        # Adjusted: 924 -> 512 -> 256 -> 128 -> 64
         self.backbone = nn.Sequential(
-            _make_fc(obs_dim, 256),
+            _make_fc(obs_dim, 512),
+            nn.ReLU(),
+            _make_fc(512, 256),
             nn.ReLU(),
             _make_fc(256, 128),
             nn.ReLU(),

@@ -15,7 +15,7 @@ robot_count = 4
 
 # Number of chargers. Range: 1~4 (integer). When less than 4, spawn points are randomly chosen.
 # 充电桩数量。可配置范围为1～4（整数）。当配置小于4时，将从每张地图可生成充电桩的点位随机选择对应数量的点位生成。
-charger_count = 3
+charger_count = 4
 
 # Maximum steps. The task ends when the predicted steps in a single round reach the maximum. Range: 1~2000.
 # 最大步数。单局任务预测步数达到最大步数时，任务结束。可配置范围为1～2000。
@@ -23,4 +23,4 @@ max_step = 1000
 
 # Maximum battery. The battery level when fully charged. Range: 100~999.
 # 最大电量。满电状态下的电量。可配置范围100～999。
-battery_max = 150
+battery_max = 200

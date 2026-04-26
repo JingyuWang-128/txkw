@@ -402,19 +402,18 @@ class Preprocessor:
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
-        """Local view feature (98D): dual-channel 3×3 avg pool on 21×21 view.
+        """Local view feature (882D): direct dual-channel 21×21 view.
 
-        局部视野特征（98D）：21×21视野按双通道做3×3平均池化，输出7×7×2=98D。
-        通道: [0]障碍率 [1]污渍率。
-        已清扫率 = 1 - 障碍率 - 污渍率，线性冗余故省略。
+        局部视野特征（882D）：直接使用21×21视野，不做3×3池化。
+        通道: [0]障碍 {0/1} [1]污渍 {0/1}。
         """
         view = self._view_map  # values: 0=obstacle, 1=cleaned, 2=dirt
-        h, w = view.shape
-        ph, pw = h // 3, w // 3
-        blocks = view[:ph*3, :pw*3].reshape(ph, 3, pw, 3)  # (7, 3, 7, 3)
-        obstacle = (blocks == 0).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
-        dirt     = (blocks == 2).mean(axis=(1, 3)).astype(np.float32)  # (7,7)
-        return np.concatenate([obstacle.flatten(), dirt.flatten()])  # 98D
+        if view is None or view.shape != (21, 21):
+            return np.zeros(2 * 21 * 21, dtype=np.float32)
+
+        obstacle = (view == 0).astype(np.float32).flatten()
+        dirt = (view == 2).astype(np.float32).flatten()
+        return np.concatenate([obstacle, dirt])  # 882D
 
     def _get_global_state_feature(self):
         """Global state feature (6D).
@@ -632,13 +631,13 @@ class Preprocessor:
         return np.array([d_ch / max_bfs, d_di / max_bfs, reach_ratio, urgency], dtype=np.float32)
 
     def feature_process(self, env_obs, last_action):
-        """Generate 140D feature vector, legal action mask, and scalar reward.
+        """Generate 924D feature vector, legal action mask, and scalar reward.
 
-        生成 140D 特征向量（98D视野 + 6D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 11D轨迹 + 5D记忆 + 4D BFS）、合法动作掩码和标量奖励。
+        生成 924D 特征向量（882D视野 + 6D全局 + 8D合法动作 + 4D充电桩 + 4D NPC + 11D轨迹 + 5D记忆 + 4D BFS）、合法动作掩码和标量奖励。
         """
         self.pb2struct(env_obs, last_action)
 
-        local_view = self._get_local_view_feature()  # 98D (obstacle+dirt each 7x7)
+        local_view = self._get_local_view_feature()  # 882D (obstacle+dirt each 21x21)
         global_state = self._get_global_state_feature()  # 6D
         legal_action = self.get_legal_action()  # 8D
         legal_arr = np.array(legal_action, dtype=np.float32)
@@ -663,36 +662,15 @@ class Preprocessor:
         
         综合客体化奖励，根据阶段轮流调整权重。
         """
-        # Phase-based weight scheduling / 阶段化权重调度
-        step = self.step_no
-        
-        if step < 1000:  # Early phase: encourage exploration
-            w_clean   = 0.04
-            w_charge  = 0.05
-            w_npc     = 0.03
-            w_new     = 0.015  # 7.5x increase from 0.002
-            w_repeat  = 0.002  # 4x increase from 0.0005
-            w_streak  = 0.001
-            w_idle    = 0.001
-        
-        elif step < 1800:  # Middle phase: balance exploration and cleaning
-            w_clean   = 0.03
-            w_charge  = 0.04  # 1.5x increase from 0.08
-            w_npc     = 0.03
-            w_new     = 0.008  # Still encouraged but lower than early
-            w_repeat  = 0.002
-            w_streak  = 0.001
-            w_idle    = 0.001
-        
-        else:  # Late phase: focus on cleaning and efficiency
-            w_clean   = 0.03
-            w_charge  = 0.03
-            w_npc     = 0.04
-            w_new     = 0.002  # Back to low exploration
-            w_repeat  = 0.003  # 6x increase from 0.0005, strong penalty
-            w_streak  = 0.002  # 2x increase
-            w_idle    = 0.002  # 2x increase
-        
+        # Unified weight scheduling / 统一权重配置
+        w_npc     = 0.03  # NPC avoidance is highest priority
+        w_charge  = 0.05  # charging is next most important
+        w_clean   = 0.03  # cleaning remains important but secondary
+        w_new     = 0.0005  # exploration incentive for new cells/path
+        w_repeat  = 0.0002  # penalty for repeated loops
+        w_streak  = 0.0005
+        w_idle    = 0.0005
+
         # Cleaning reward / 清扫奖励
         self.cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
         r_clean = w_clean * float(self.cleaned_this_step)
@@ -724,20 +702,19 @@ class Preprocessor:
         # High battery: passive charging / 高电量：被动充电
         batt_ratio = self.battery / max(self.battery_max, 1)
         
+        reach_r = self.battery / max(self.bfs_d_charger, 1.0)
         if batt_ratio < 0.30:
             # Emergency charging: charge regardless of distance / 紧急充电：无视距离
             gate = 1.0
-            
+
         elif batt_ratio < 0.60:
             # Active charging: charge if reachable / 主动充电：可达时充电
-            reach_r = self.battery / max(self.bfs_d_charger, 1.0)
             gate = float(np.clip(1.0 - reach_r / 3.0, 0.3, 1.0))  # gate in [0.3, 1.0]
-            
+
         else:
             # Passive charging: original logic / 被动充电：原逻辑
-            reach_r = self.battery / max(self.bfs_d_charger, 1.0)
             gate = float(np.clip((2.0 - reach_r) / 2.0, 0.0, 1.0))
-        
+
         # Prefer BFS distance (Phase2) / 优先用BFS路径距离
         d_bfs_norm = float(np.clip(self.bfs_d_charger / 256.0, 0.0, 1.0))
         d_euc_norm = float(np.clip(self._charger_feats()[0], 0.0, 1.0))
@@ -746,6 +723,12 @@ class Preprocessor:
         last_phi = -float(np.clip(self.last_d_charger_norm, 0.0, 1.0))
         r_charge = w_charge * gate * (phi - last_phi)
         self.last_d_charger_norm = d_charger_norm
+
+        # Low-battery safety penalty: if charger is far relative to battery, discourage too much exploration
+        r_low_batt = 0.0
+        safety_margin = 1.2
+        if reach_r < safety_margin:
+            r_low_batt = -0.02 * (safety_margin - reach_r)
 
         # Step penalty (分段) / 步数惩罚（分段）
         # 前期正激励鼓励多走，中期中性，后期负惩罚
@@ -779,7 +762,7 @@ class Preprocessor:
         # Wall collision penalty: wasted step + battery / 撞墙惩罚：浪费步数+电量
         wall_penalty = -0.02 * self.wall_hit
 
-        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_coverage + r_escape + step_penalty + wall_penalty)
+        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + r_coverage + r_escape + step_penalty + wall_penalty + r_low_batt)
 
         self.last_reward_components = {
             "cleaning": float(r_clean),
@@ -791,6 +774,7 @@ class Preprocessor:
             "eff_idle": float(r_idle),
             "coverage_gain": float(r_coverage),
             "escape": float(r_escape),
+            "low_battery": float(r_low_batt),
             "step_penalty": float(step_penalty),
             "wall_penalty": float(wall_penalty),
             "d_charger_norm": float(d_charger_norm),
