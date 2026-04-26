@@ -16,6 +16,7 @@ class Config:
     # Feature dimensions
     # 特征维度
     FEATURES = [
+<<<<<<< HEAD
         2 * 21 * 21, # local view: direct dual-channel 21×21 view (obstacle/dirt) = 882
         6,          # global state
         8,          # legal action
@@ -24,6 +25,16 @@ class Config:
         11,         # traj feats (K=1 => 8 + dx/dz + loop)
         5,          # memory feats (原3 → 5)
         4,          # bfs feats (charger_dist + dirt_dist + reach_ratio + urgency)
+=======
+        2 * 7 * 7, # local view: dual-channel avg pool (obstacle/dirt) 21×21→7×7×2=98
+        9,         # global state (6 base + battery_max + n_chargers + n_npcs)
+        8,         # legal action
+        7,         # charger feats (nearest: dist+dx+dz, target: dist+dx+dz, urgency)
+        4,         # npc feats
+        11,        # traj feats (K=1 => 8 + dx/dz + loop)
+        5,         # memory feats
+        6,         # bfs feats (charger_dist + dirt_dist + dirt_dx + dirt_dz + reach_ratio + urgency)
+>>>>>>> 7eee61518a283351868af4fd94842827e702d9bd
     ]
     FEATURE_SPLIT_SHAPE = FEATURES
     FEATURE_LEN = sum(FEATURES)
@@ -43,7 +54,9 @@ class Config:
     LAMDA = 0.95
 
     INIT_LEARNING_RATE_START = 0.0003
-    BETA_START = 0.001
+    BETA_START = 0.005          # entropy coef start (moderate exploration) / 熵系数起始值（适度探索）
+    BETA_END = 0.001            # entropy coef end (low for late convergence) / 熵系数终值（收敛）
+    BETA_DECAY_STEPS = 50000    # steps to decay from BETA_START to BETA_END / 衰减步数
     CLIP_PARAM = 0.2
     VF_COEF = 0.5
 

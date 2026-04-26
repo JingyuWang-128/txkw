@@ -12,6 +12,8 @@ Training workflow for Robot Vacuum.
 
 import os
 import time
+import random
+import copy
 
 import numpy as np
 
@@ -64,6 +66,24 @@ class EpisodeRunner:
         self.last_report_monitor_time = 0
         self.last_get_training_metrics_time = 0
 
+    # Domain randomization ranges (evaluation conditions)
+    # 域随机化范围（评估条件）
+    DR_BATTERY_MAX = [150, 200, 300]
+    DR_CHARGER_COUNT = [2, 3, 4]
+    DR_ROBOT_COUNT = [2, 3, 4]
+
+    def _randomize_conf(self):
+        """Apply domain randomization to usr_conf before each episode.
+
+        每局开始前随机化环境配置，确保智能体在多种条件下训练。
+        """
+        conf = copy.deepcopy(self.usr_conf)
+        env_conf = conf.get("env_conf", conf)
+        env_conf["battery_max"] = random.choice(self.DR_BATTERY_MAX)
+        env_conf["charger_count"] = random.choice(self.DR_CHARGER_COUNT)
+        env_conf["robot_count"] = random.choice(self.DR_ROBOT_COUNT)
+        return conf
+
     def run_episodes(self):
         """Run a single episode and yield collected samples.
 
@@ -79,9 +99,14 @@ class EpisodeRunner:
                 if training_metrics is not None:
                     self.logger.info(f"training_metrics: {training_metrics}")
 
+            # Domain randomization: vary battery/charger/NPC each episode
+            # 域随机化：每局随机电量/充电桩/NPC数量
+            ep_conf = self._randomize_conf()
+            ep_env_conf = ep_conf.get("env_conf", ep_conf)
+
             # Reset environment
             # 重置环境
-            env_obs = self.env.reset(self.usr_conf)
+            env_obs = self.env.reset(ep_conf)
             if handle_disaster_recovery(env_obs, self.logger):
                 continue
 
@@ -89,6 +114,10 @@ class EpisodeRunner:
             # 重置 Agent，加载最新模型
             self.agent.reset(env_obs)
             self.agent.load_model(id="latest")
+
+            # Sync battery_max to preprocessor so features are consistent
+            # 同步 battery_max 到预处理器，确保特征一致
+            self.agent.preprocessor.battery_max = int(ep_env_conf.get("battery_max", 200))
 
             # Initial observation processing
             # 初始观测
@@ -105,7 +134,12 @@ class EpisodeRunner:
             ep_max_coverage = 0.0
             ep_idle_steps = 0
 
-            self.logger.info(f"Episode {self.episode_cnt} start")
+            self.logger.info(
+                f"Episode {self.episode_cnt} start "
+                f"[DR battery={ep_env_conf.get('battery_max')}, "
+                f"charger={ep_env_conf.get('charger_count')}, "
+                f"npc={ep_env_conf.get('robot_count')}]"
+            )
 
             while not done:
                 # Agent inference / 推理动作
@@ -153,24 +187,20 @@ class EpisodeRunner:
                     total_score = env_obs["observation"]["env_info"]["total_score"]
 
                     if truncated:
-                        # Survived to max steps: higher cleaning ratio → more reward
-                        # 存活到最大步数：清扫比例越高奖励越多
+                        # Survived to max steps: moderate reward for survival + cleaning
+                        # 存活到最大步数：适度奖励存活 + 清扫比例加成
                         cleaning_ratio = fm.dirt_cleaned / max(fm.total_dirt, 1)
-                        final_reward = 5.0 + 5.0 * cleaning_ratio
+                        final_reward = 0.5 + 2.0 * cleaning_ratio
                         result_str = "WIN"
                     else:
-                        # Early termination (battery depleted or collision): distinguish penalty
-                        # 提前结束（电量耗尽或碰撞）：区分惩罚
+                        # Early death = bad, regardless of cause
+                        # 提前死亡 = 适度惩罚（过大会导致GAE方差爆炸）
                         if ep_min_npc_dist < 0.5:
-                            # NPC collision: severe penalty
-                            # NPC碰撞：严重惩罚
-                            final_reward = -10.0
+                            final_reward = -1.0
                             result_str = "NPC_COLLISION"
                         else:
-                            # Battery depleted or other early termination
-                            # 电量耗尽或其他提前结束
-                            final_reward = -2.0
-                            result_str = "FAIL"
+                            final_reward = -1.0
+                            result_str = "BATTERY_DEAD"
 
                     comp_str = " ".join(
                         [f"{k}:{ep_reward_comps.get(k, 0.0):.3f}" for k in sorted(ep_reward_comps.keys())]

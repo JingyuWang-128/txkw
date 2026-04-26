@@ -38,7 +38,11 @@ class Model(nn.Module):
         self.model_name = "robot_vacuum"
         self.device = device
 
+<<<<<<< HEAD
         obs_dim = Config.DIM_OF_OBSERVATION  # 924
+=======
+        obs_dim = Config.DIM_OF_OBSERVATION  # 148
+>>>>>>> 7eee61518a283351868af4fd94842827e702d9bd
         act_num = Config.ACTION_NUM  # 8
 
         # Expanded backbone for improved representation capacity / 扩大的骨干网络以提升表示能力
