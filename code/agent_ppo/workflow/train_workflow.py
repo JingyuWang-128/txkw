@@ -10,7 +10,9 @@ Training workflow for Robot Vacuum.
 清扫大作战训练工作流。
 """
 
+import copy
 import os
+import random
 import time
 
 import numpy as np
@@ -64,6 +66,18 @@ class EpisodeRunner:
         self.last_report_monitor_time = 0
         self.last_get_training_metrics_time = 0
 
+    def _randomize_conf(self):
+        """Create a per-episode config with domain-randomized env params.
+
+        每局随机化环境参数，覆盖评估时的所有可能组合。
+        """
+        conf = copy.deepcopy(self.usr_conf)
+        env_conf = conf.setdefault("env_conf", {})
+        env_conf["battery_max"] = random.choice([150, 200, 300])
+        env_conf["charger_count"] = random.choice([2, 3, 4])
+        env_conf["robot_count"] = random.choice([2, 3, 4])
+        return conf
+
     def run_episodes(self):
         """Run a single episode and yield collected samples.
 
@@ -79,9 +93,13 @@ class EpisodeRunner:
                 if training_metrics is not None:
                     self.logger.info(f"training_metrics: {training_metrics}")
 
+            # Domain randomization: sample env params each episode
+            # 域随机化：每局随机采样环境参数
+            ep_conf = self._randomize_conf()
+
             # Reset environment
             # 重置环境
-            env_obs = self.env.reset(self.usr_conf)
+            env_obs = self.env.reset(ep_conf)
             if handle_disaster_recovery(env_obs, self.logger):
                 continue
 
@@ -156,12 +174,12 @@ class EpisodeRunner:
                         # Survived to max steps: higher cleaning ratio → more reward
                         # 存活到最大步数：清扫比例越高奖励越多
                         cleaning_ratio = fm.dirt_cleaned / max(fm.total_dirt, 1)
-                        final_reward = 5.0 + 5.0 * cleaning_ratio
+                        final_reward = 0.5 + 0.5 * cleaning_ratio
                         result_str = "WIN"
                     else:
                         # Early termination (battery depleted or collision): small penalty
                         # 提前结束（电量耗尽或碰撞）：小惩罚
-                        final_reward = -2.0
+                        final_reward = -0.5
                         result_str = "FAIL"
 
                     comp_str = " ".join(

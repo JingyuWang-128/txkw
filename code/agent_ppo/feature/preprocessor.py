@@ -44,8 +44,8 @@ class Preprocessor:
         对局开始时重置所有状态。
         """
         self.step_no = 0
-        self.battery = 600
-        self.battery_max = 600
+        self.battery = 0
+        self.battery_max = 1
 
         self.cur_pos = (0, 0)
 
@@ -66,7 +66,8 @@ class Preprocessor:
         self._legal_act = [1] * 8
 
         # -------- Phase1: entity parsing & history state --------
-        self.chargers = []  # list[(x,z)]
+        self.chargers = []  # list[(x,z)] current frame visible
+        self.known_chargers = set()  # persistent charger memory across frames
         self.npcs = []  # list[(x,z)]
         self.step_cleaned_cells = []  # list[(x,z)]
 
@@ -151,9 +152,18 @@ class Preprocessor:
                     if int(o.get("sub_type", -1)) != 1:
                         continue
                     p = o.get("pos", {})
-                    self.chargers.append((int(p.get("x", 0)), int(p.get("z", 0))))
+                    # +1 center correction: charger is 3x3, pos is top-left
+                    # +1 中心修正：充电桩占 3×3，pos 是左上角
+                    cx = int(p.get("x", 0)) + 1
+                    cz = int(p.get("z", 0)) + 1
+                    self.chargers.append((cx, cz))
+                    self.known_chargers.add((cx, cz))
                 except Exception:
                     continue
+        # Use persistent memory so chargers are never "forgotten"
+        # 使用持久化记忆，走远后不会“忘记”充电桩位置
+        if self.known_chargers:
+            self.chargers = list(self.known_chargers)
 
         self.npcs = []
         npcs = frame_state.get("npcs") if isinstance(frame_state, dict) else None
@@ -558,14 +568,15 @@ class Preprocessor:
         return feature, legal_action, reward
 
     def reward_process(self):
-        # Weights (充电优先模式) / 权重（充电优先模式）
-        w_clean = 0.03       # 清扫奖励：降低（原0.12），变为次要目标
-        w_charge = 0.05     # 充电奖励：增强（原0.02）
-        w_npc = 0.03        # NPC躲避：保持不变
-        w_new = 0.0005      # 探索新格子：降低（原0.002）
-        w_repeat = 0.0002   # 回环惩罚：降低（原0.0005）
-        w_streak = 0.0005   # 连清奖励：降低（原0.0015）
-        w_idle = 0.0005     # 空跑惩罚：降低（原0.0025）
+        # Weights / 权重（清扫为主，回充为辅）
+        w_clean = 0.10       # 清扫奖励：主目标，权重最高
+        w_charge_nav = 0.03  # 回充导航：低电量时引导靠近充电桩
+        w_charge_act = 0.08  # 成功充电奖励：踏上充电桩恢复电量
+        w_npc =30        # NPC躲避
+        w_new = 0.001        # 探索新格子
+        w_repeat = 0.0003    # 回环惩罚
+        w_streak = 0.001     # 连清奖励
+        w_idle = 0.001       # 空跑惩罚
 
         # Cleaning reward / 清扫奖励
         self.cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
@@ -587,27 +598,27 @@ class Preprocessor:
         r_repeat = -w_repeat * float(self.loop_flag)
 
         # Charger navigation: potential-based shaping (low battery gated)
-        # 回充导航：势函数差分（始终激活）
-        # gate = 1.0 始终激活，引导智能体始终靠近充电桩
-        gate = 1.0
+        # 回充导航：势函数差分（仅低电量时激活，避免与清扫目标冲突）
+        battery_ratio = _norm(self.battery, self.battery_max)
+        charge_thr = 0.4  # 电量 < 40% 时开始引导回充
+        gate = float(np.clip((charge_thr - battery_ratio) / max(charge_thr, 1e-6), 0.0, 1.0))
         # Prefer BFS path distance if available (Phase2) / 若可用优先用 BFS 路径距离
         d_bfs_norm = float(np.clip(self.bfs_d_charger / 256.0, 0.0, 1.0))
         d_euc_norm = float(np.clip(self._charger_feats()[0], 0.0, 1.0))
         d_charger_norm = d_bfs_norm if d_bfs_norm < 1.0 else d_euc_norm
         phi = -d_charger_norm
         last_phi = -float(np.clip(self.last_d_charger_norm, 0.0, 1.0))
-        r_charge = w_charge * gate * (phi - last_phi)
+        r_charge_nav = w_charge_nav * gate * (phi - last_phi)
         self.last_d_charger_norm = d_charger_norm
 
-        # Step penalty (分段) / 步数惩罚（分段）
-        # 前期正激励鼓励多走，中期中性，后期负惩罚
-        step = getattr(self, 'step_no', 0)
-        if step < 300:
-            step_penalty = 0.001
-        elif step < 700:
-            step_penalty = 0.0
-        else:
-            step_penalty = -0.001
+        # Actual charging reward: battery increased (skip step 1 to avoid init spike)
+        # 成功充电奖励：电量回升时给予正奖励（跳过首步避免初始化尖刺）
+        battery_gained = max(0, self.battery - self.last_battery) if self.step_no > 1 else 0
+        r_charge_act = w_charge_act * float(battery_gained > 0) if battery_ratio < 0.95 else 0.0
+
+        # Step penalty: fixed small negative to encourage efficiency
+        # 步数惩罚：固定小负值，鼓励高效清扫
+        step_penalty = -0.0005
 
         # NPC avoid: soft penalty inside safe radius / NPC 躲避：安全半径内软惩罚
         safe_radius = 2.5
@@ -615,11 +626,12 @@ class Preprocessor:
         s = max(0.0, (safe_radius - d_npc) / safe_radius)
         r_npc = -w_npc * (s * s)
 
-        total = float(r_clean + r_charge + r_npc + r_new + r_repeat + r_streak + r_idle + step_penalty)
+        total = float(r_clean + r_charge_nav + r_charge_act + r_npc + r_new + r_repeat + r_streak + r_idle + step_penalty)
 
         self.last_reward_components = {
             "cleaning": float(r_clean),
-            "charge_nav": float(r_charge),
+            "charge_nav": float(r_charge_nav),
+            "charge_act": float(r_charge_act),
             "npc_avoid": float(r_npc),
             "explore_new": float(r_new),
             "explore_repeat": float(r_repeat),
@@ -627,6 +639,7 @@ class Preprocessor:
             "eff_idle": float(r_idle),
             "step_penalty": float(step_penalty),
             "d_charger_norm": float(d_charger_norm),
+            "battery_gate": float(gate),
             "total": total,
         }
 
